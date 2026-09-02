@@ -447,6 +447,16 @@ def combined_article_text(article):
     ).lower()
 
 
+def article_content_text(article):
+    """Title + description only, so feed labels cannot make a story relevant."""
+    return " ".join(
+        [
+            article.get("title", ""),
+            article.get("description", ""),
+        ]
+    ).lower()
+
+
 def count_keyword_hits(text, keywords):
     return sum(1 for keyword in keywords if keyword in text)
 
@@ -463,7 +473,7 @@ def is_dhivehi_story(article):
 
 
 def environmental_relevance_score(article):
-    text = combined_article_text(article)
+    text = article_content_text(article)
 
     strong_hits = count_keyword_hits(text, STRONG_ENVIRONMENT_PHRASES)
     topic_hits = count_keyword_hits(text, ALL_TOPIC_KEYWORDS)
@@ -480,7 +490,7 @@ def environmental_relevance_score(article):
 
 
 def is_environment_story(article):
-    text = combined_article_text(article)
+    text = article_content_text(article)
 
     # One strong phrase is enough. Otherwise require multiple topic signals.
     if any(phrase in text for phrase in STRONG_ENVIRONMENT_PHRASES):
@@ -498,7 +508,7 @@ def is_environment_story(article):
 
 
 def detect_category(article):
-    text = combined_article_text(article)
+    text = article_content_text(article)
 
     scores = {
         "Climate Change": count_keyword_hits(text, CLIMATE_KEYWORDS),
@@ -527,7 +537,7 @@ def detect_category(article):
 
 
 def is_breaking_story(article):
-    text = combined_article_text(article)
+    text = article_content_text(article)
     return any(keyword in text for keyword in BREAKING_ENVIRONMENT_KEYWORDS)
 
 
@@ -535,7 +545,7 @@ def calculate_importance(article):
     if not is_environment_story(article):
         return 0
 
-    text = combined_article_text(article)
+    text = article_content_text(article)
     score = 35
 
     score += min(environmental_relevance_score(article) * 3, 30)
