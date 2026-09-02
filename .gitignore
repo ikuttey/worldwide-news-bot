@@ -1,0 +1,7 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+climate_environment_news_state.json
+worldwide_news_state.json
