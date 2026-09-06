@@ -6,6 +6,10 @@ the requesting user's private chat. Slash-command menus are exposed only in priv
 chats. Any manually typed group command is deleted on a best-effort basis before its
 result is routed privately.
 
+A single group control-panel message carries the inline buttons. It is refreshed on
+startup and pinned on a best-effort basis so the group always has an easy-to-find
+menu without bringing back reply-keyboard messages.
+
 The existing unified news/archive engine continues to live in main.py.
 """
 
@@ -14,7 +18,7 @@ import logging
 
 import main as bot
 
-UI_VERSION = "all-news-v6-private-inline-no-group-commands"
+UI_VERSION = "all-news-v7-persistent-inline-control-panel"
 
 _base_handle_message = bot.handle_message
 _base_handle_callback = bot.handle_callback
@@ -35,6 +39,18 @@ def group_inline_keyboard():
             {"text": "📩 Open Private News", "url": f"https://t.me/{username}?start=menu"}
         ])
     return {"inline_keyboard": rows}
+
+
+def group_control_panel_text():
+    return (
+        "📰 <b>Maldives & World News</b>\n\n"
+        "Choose what you want to read. Your selection will <b>not</b> appear in this group. "
+        "The result is sent only to your private chat with the bot.\n\n"
+        "🇲🇻 Maldives — English + Dhivehi\n"
+        "🌍 Global — worldwide news\n"
+        "🚨 Important — breaking and high-priority stories\n"
+        "🧭 News Topics — browse by category"
+    )
 
 
 def silent_send_private(message, text, reply_markup=None, start_payload="menu"):
@@ -167,36 +183,92 @@ def handle_message(message):
     from_group = is_group_message(message)
 
     if from_group and (text in STALE_GROUP_BUTTONS or text.startswith("/")):
-        # Inline callbacks never create group messages. This path exists only for
-        # cached reply keyboards and users who manually type slash commands.
-        # Deleting another user's group message requires Telegram's Delete Messages
-        # permission for the bot, so this is intentionally best effort.
         delete_group_interaction_message(message)
 
-    # The unified core routes supported commands/buttons to the sender's private ID.
     return _base_handle_message(message)
 
 
 async def configure_command_scopes():
     """Show Telegram slash commands only in private chats, never in groups."""
-    # Clear the old default/global command list left by previous deployments.
     await asyncio.to_thread(
         bot.telegram_api,
         "setMyCommands",
         {"commands": [], "scope": {"type": "default"}},
     )
-    # Explicitly keep group chats command-free even if Telegram has cached defaults.
     await asyncio.to_thread(
         bot.telegram_api,
         "setMyCommands",
         {"commands": [], "scope": {"type": "all_group_chats"}},
     )
-    # Preserve the convenient command menu inside each user's private bot chat.
     await asyncio.to_thread(
         bot.telegram_api,
         "setMyCommands",
         {"commands": bot.PUBLIC_COMMANDS, "scope": {"type": "all_private_chats"}},
     )
+
+
+async def remove_old_reply_keyboard_if_needed():
+    if bot.get_setting("reply_keyboard_removed_version") == UI_VERSION:
+        return
+
+    removal = await asyncio.to_thread(
+        bot.send_message,
+        "🔒 Switching group browsing to silent private mode…",
+        bot.GROUP_CHAT_ID,
+        {"remove_keyboard": True},
+        True,
+    )
+
+    if isinstance(removal, dict) and removal.get("message_id"):
+        await asyncio.sleep(1)
+        await asyncio.to_thread(
+            bot.telegram_api,
+            "deleteMessage",
+            {"chat_id": str(bot.GROUP_CHAT_ID), "message_id": removal["message_id"]},
+        )
+
+    bot.set_setting("reply_keyboard_removed_version", UI_VERSION)
+
+
+async def refresh_group_control_panel():
+    """Keep exactly one fresh inline control panel in the group when possible."""
+    old_message_id = bot.get_setting("group_control_panel_message_id")
+    if old_message_id:
+        try:
+            await asyncio.to_thread(
+                bot.telegram_api,
+                "deleteMessage",
+                {"chat_id": str(bot.GROUP_CHAT_ID), "message_id": int(old_message_id)},
+            )
+        except (TypeError, ValueError):
+            pass
+
+    panel = await asyncio.to_thread(
+        bot.send_message,
+        group_control_panel_text(),
+        bot.GROUP_CHAT_ID,
+        group_inline_keyboard(),
+        True,
+    )
+
+    if isinstance(panel, dict) and panel.get("message_id"):
+        message_id = panel["message_id"]
+        bot.set_setting("group_control_panel_message_id", message_id)
+        # Pinning is best effort. It requires the bot to have the relevant group
+        # administrator permission, but failure does not affect the buttons.
+        await asyncio.to_thread(
+            bot.telegram_api,
+            "pinChatMessage",
+            {
+                "chat_id": str(bot.GROUP_CHAT_ID),
+                "message_id": message_id,
+                "disable_notification": True,
+            },
+        )
+        return panel
+
+    logging.error("Could not create the group inline control panel")
+    return None
 
 
 async def main():
@@ -209,37 +281,9 @@ async def main():
     bot.BOT_USERNAME = str(info.get("username") or "").strip().lstrip("@")
 
     await configure_command_scopes()
-
-    if bot.get_setting("startup_announcement_version") != UI_VERSION:
-        # Remove the old persistent reply keyboard. This temporary message is
-        # deleted after Telegram clients receive the keyboard-removal update.
-        removal = await asyncio.to_thread(
-            bot.send_message,
-            "🔒 Switching group browsing to silent private mode…",
-            bot.GROUP_CHAT_ID,
-            {"remove_keyboard": True},
-            True,
-        )
-
-        await asyncio.to_thread(
-            bot.send_message,
-            bot.welcome_text() +
-            "\n\n<b>Tap the buttons below.</b> Your selection is not posted in the group; results are sent privately. "
-            "Slash commands are available only in your private bot chat.",
-            bot.GROUP_CHAT_ID,
-            group_inline_keyboard(),
-            True,
-        )
-
-        if isinstance(removal, dict) and removal.get("message_id"):
-            await asyncio.sleep(1)
-            await asyncio.to_thread(
-                bot.telegram_api,
-                "deleteMessage",
-                {"chat_id": str(bot.GROUP_CHAT_ID), "message_id": removal["message_id"]},
-            )
-
-        bot.set_setting("startup_announcement_version", UI_VERSION)
+    await remove_old_reply_keyboard_if_needed()
+    await refresh_group_control_panel()
+    bot.set_setting("startup_announcement_version", UI_VERSION)
 
     await asyncio.gather(
         bot.automatic_news_loop(),
@@ -248,7 +292,6 @@ async def main():
     )
 
 
-# Replace only the interaction routing. The news engine remains in main.py.
 bot.send_private = silent_send_private
 bot.handle_callback = handle_callback
 bot.handle_message = handle_message
