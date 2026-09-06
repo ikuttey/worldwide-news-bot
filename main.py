@@ -5,346 +5,47 @@ import json
 import logging
 import os
 import re
+import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import parse_qsl, quote_plus, urlencode, urlsplit, urlunsplit
 
 import feedparser
 import requests
 
 
-# ============================================================
-# LOGGING
-# ============================================================
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-BOT_NAME = "Maldives & World Climate News"
-
+BOT_NAME = "Maldives & World News"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-
 NEWS_CHECK_INTERVAL_SECONDS = int(os.getenv("NEWS_CHECK_INTERVAL_SECONDS", "300"))
 MAX_POSTS_PER_CHECK = int(os.getenv("MAX_POSTS_PER_CHECK", "12"))
 MESSAGE_DELAY_SECONDS = float(os.getenv("MESSAGE_DELAY_SECONDS", "2"))
-MINIMUM_POST_SCORE = int(os.getenv("MINIMUM_POST_SCORE", "8"))
-MINIMUM_AI_SCORE = int(os.getenv("MINIMUM_AI_SCORE", "78"))
-MAX_AI_REQUESTS_PER_CHECK = int(os.getenv("MAX_AI_REQUESTS_PER_CHECK", "2"))
-MAX_AI_REQUESTS_PER_HOUR = int(os.getenv("MAX_AI_REQUESTS_PER_HOUR", "10"))
-AI_QUOTA_COOLDOWN_MINUTES = 30
-DUPLICATE_SIMILARITY_THRESHOLD = 0.68
-HISTORY_RETENTION_DAYS = 7
-
+MINIMUM_POST_SCORE = int(os.getenv("MINIMUM_POST_SCORE", "58"))
+FETCH_WORKERS = max(2, min(16, int(os.getenv("FETCH_WORKERS", "8"))))
+PRIVATE_PAGE_SIZE = max(5, min(12, int(os.getenv("PRIVATE_PAGE_SIZE", "8"))))
+USER_REQUEST_LIMIT = max(5, int(os.getenv("USER_REQUEST_LIMIT", "30")))
+USER_REQUEST_WINDOW_SECONDS = max(60, int(os.getenv("USER_REQUEST_WINDOW_SECONDS", "300")))
+ADMIN_USER_IDS = {item.strip() for item in os.getenv("ADMIN_USER_IDS", "").split(",") if item.strip()}
 MALDIVES_TIMEZONE = timezone(timedelta(hours=5))
 MORNING_DIGEST_HOUR = 7
 EVENING_DIGEST_HOUR = 19
+ARCHIVE_RETENTION_DAYS = int(os.getenv("ARCHIVE_RETENTION_DAYS", "90"))
+APP_VERSION = "all-news-v4"
 
-STATE_FILE = Path(os.getenv("STATE_FILE", "climate_environment_news_state.json"))
-
-
-# ============================================================
-# RSS FEED HELPERS
-# ============================================================
-
-def google_news_feed(query, region="MV", language="en"):
-    encoded_query = quote_plus(query)
-    return (
-        "https://news.google.com/rss/search?"
-        f"q={encoded_query}"
-        f"&hl={language}"
-        f"&gl={region}"
-        f"&ceid={region}:{language}"
-    )
-
-
-# Broad Maldivian publishers are intentionally included, but every article
-# passes a strict climate/environment relevance filter before publication.
-MALDIVES_RSS_FEEDS = {
-    "🇲🇻 PSM News": "https://psmnews.mv/feed",
-    "🇲🇻 Sun Online": "https://sun.mv/rss",
-    "🇲🇻 Dhiyares": "https://dhiyares.com/rss",
-    "🇲🇻 Adhadhu": "https://adhadhu.com/rss",
-    "🇲🇻 VNews": "https://vnews.mv/rss",
-    "🇲🇻 Miadhu": "https://miadhu.com/feed",
-    "🇲🇻 Times of Addu": "https://timesofaddu.com/feed",
-}
-
-MALDIVES_GOOGLE_FEEDS = {
-    "🇲🇻 Maldives Climate": google_news_feed(
-        '"Maldives" ("climate change" OR warming OR emissions OR "sea level") when:1d'
-    ),
-    "🇲🇻 Maldives Environment": google_news_feed(
-        '"Maldives" (environment OR conservation OR biodiversity OR pollution) when:1d'
-    ),
-    "🇲🇻 Maldives Reefs & Ocean": google_news_feed(
-        '"Maldives" (coral OR reef OR ocean OR marine OR bleaching) when:1d'
-    ),
-    "🇲🇻 Maldives Waste & Erosion": google_news_feed(
-        '"Maldives" (waste OR plastic OR erosion OR shoreline OR dredging) when:1d'
-    ),
-    "🇲🇻 Maldives Wildlife": google_news_feed(
-        '"Maldives" (wildlife OR turtle OR shark OR manta OR dolphin OR whale) when:1d'
-    ),
-    "🇲🇻 Maldives Clean Energy": google_news_feed(
-        '"Maldives" ("renewable energy" OR solar OR decarbonization OR "clean energy") when:1d'
-    ),
-    "🇲🇻 Maldives Extreme Weather": google_news_feed(
-        '"Maldives" (flood OR storm OR swell OR cyclone OR heatwave OR "heavy rain") when:1d'
-    ),
-    "🇲🇻 ތިމާވެށި": google_news_feed(
-        "ދިވެހިރާއްޖެ ތިމާވެށި when:1d", region="MV", language="dv"
-    ),
-    "🇲🇻 ކްލައިމެޓް": google_news_feed(
-        "ދިވެހިރާއްޖެ ކްލައިމެޓް when:1d", region="MV", language="dv"
-    ),
-    "🇲🇻 ފަރު އަދި ކޮރަލް": google_news_feed(
-        "ރާއްޖެ ފަރު ކޮރަލް when:1d", region="MV", language="dv"
-    ),
-    "🇲🇻 ކުނި އަދި ޕްލާސްޓިކް": google_news_feed(
-        "ރާއްޖެ ކުނި ޕްލާސްޓިކް when:1d", region="MV", language="dv"
-    ),
-}
-
-GLOBAL_ENVIRONMENT_RSS = {
-    "🌍 BBC Science & Environment": "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml",
-    "🌍 The Guardian Environment": "https://www.theguardian.com/environment/rss",
-    "🌍 Mongabay": "https://news.mongabay.com/feed/",
-    "🌍 Carbon Brief": "https://www.carbonbrief.org/feed/",
-    "🌍 Inside Climate News": "https://insideclimatenews.org/feed/",
-    "🌍 NASA": "https://www.nasa.gov/news-release/feed/",
-}
-
-GLOBAL_GOOGLE_FEEDS = {
-    "🌍 Global Climate": google_news_feed(
-        '"climate change" OR "global warming" OR decarbonization when:12h',
-        region="US",
-    ),
-    "🌊 Global Ocean & Reefs": google_news_feed(
-        'ocean OR coral OR reef OR "marine conservation" when:12h',
-        region="US",
-    ),
-    "🦋 Global Biodiversity": google_news_feed(
-        'biodiversity OR wildlife OR conservation OR extinction when:12h',
-        region="US",
-    ),
-    "♻️ Global Pollution & Waste": google_news_feed(
-        'pollution OR plastic OR waste OR microplastics when:12h',
-        region="US",
-    ),
-    "🌳 Global Forests": google_news_feed(
-        'deforestation OR forest OR mangrove OR peatland when:12h',
-        region="US",
-    ),
-    "⚡ Global Clean Energy": google_news_feed(
-        '"renewable energy" OR solar OR wind OR "energy transition" when:12h',
-        region="US",
-    ),
-    "🚨 Global Extreme Weather": google_news_feed(
-        'heatwave OR wildfire OR drought OR flood OR cyclone OR hurricane OR "storm surge" when:12h',
-        region="US",
-    ),
-    "🏛️ Global Climate Policy": google_news_feed(
-        '"climate policy" OR COP OR "Paris Agreement" OR "climate finance" when:12h',
-        region="US",
-    ),
-}
-
-
-# ============================================================
-# TOPICS, KEYWORDS AND FILTERING
-# ============================================================
-
-CATEGORY_EMOJIS = {
-    "Maldives Environment": "🇲🇻",
-    "Climate Change": "🌡️",
-    "Extreme Weather": "🚨",
-    "Oceans & Reefs": "🌊",
-    "Biodiversity & Wildlife": "🦋",
-    "Pollution & Waste": "♻️",
-    "Conservation & Restoration": "🌱",
-    "Forests & Mangroves": "🌳",
-    "Clean Energy": "⚡",
-    "Climate Policy & Finance": "🏛️",
-    "Science & Research": "🔬",
-    "Environment": "🌍",
-}
-
-MALDIVES_MARKERS = {
-    "maldives", "maldivian", "malé", "male", "hulhumale", "addu",
-    "baa atoll", "dharavandhoo", "hanifaru", "laamu", "gaafu",
-    "ދިވެހިރާއްޖެ", "ރާއްޖެ", "މާލެ", "ހުޅުމާލެ", "އައްޑޫ",
-}
-
-CLIMATE_KEYWORDS = {
-    "climate change", "global warming", "climate crisis", "climate action",
-    "greenhouse gas", "greenhouse gases", "emissions", "carbon emissions",
-    "methane", "decarbonization", "decarbonisation", "net zero",
-    "sea level rise", "sea-level rise", "climate adaptation",
-    "climate resilience", "climate mitigation", "warming ocean",
-    "ocean warming", "climate finance", "paris agreement",
-    "loss and damage", "ipcc", "cop30", "cop31", "climate policy",
-    "ކްލައިމެޓް", "ހޫނުވުން", "މޫސުމާ ގުޅޭ ބަދަލު",
-}
-
-OCEAN_REEF_KEYWORDS = {
-    "coral", "corals", "coral reef", "coral reefs", "coral bleaching",
-    "reef restoration", "ocean", "marine", "marine ecosystem",
-    "seagrass", "sea grass", "mangrove", "blue carbon",
-    "ocean acidification", "marine heatwave", "coastal erosion",
-    "shoreline erosion", "dredging", "reclamation", "lagoon",
-    "ފަރު", "ކޮރަލް", "ކަނޑު", "މޫދު", "ކަނޑު ދިރިއުޅުން",
-}
-
-BIODIVERSITY_KEYWORDS = {
-    "biodiversity", "wildlife", "endangered", "extinction", "species",
-    "habitat", "ecosystem", "turtle", "sea turtle", "shark", "whale",
-    "dolphin", "manta", "manta ray", "ray", "bird", "protected species",
-    "ދިރިއުޅުން", "މަސް", "ވެލާ", "ކަހަނބު",
-}
-
-POLLUTION_WASTE_KEYWORDS = {
-    "pollution", "plastic pollution", "plastic waste", "microplastic",
-    "microplastics", "waste management", "solid waste", "sewage",
-    "oil spill", "chemical spill", "marine debris", "trash", "landfill",
-    "recycling", "single-use plastic", "ކުނި", "ޕްލާސްޓިކް",
-}
-
-CONSERVATION_KEYWORDS = {
-    "conservation", "restoration", "ecosystem restoration", "reef restoration",
-    "coral restoration", "protected area", "marine protected area",
-    "nature reserve", "reforestation", "habitat restoration",
-    "environmental protection", "environment protection",
-    "ރައްކާތެރި", "ތިމާވެށި",
-}
-
-FOREST_KEYWORDS = {
-    "forest", "forests", "deforestation", "reforestation", "rainforest",
-    "mangrove", "mangroves", "peatland", "wildfire", "forest fire",
-}
-
-CLEAN_ENERGY_KEYWORDS = {
-    "renewable energy", "clean energy", "solar power", "solar energy",
-    "wind power", "wind energy", "energy transition", "battery storage",
-    "green hydrogen", "fossil fuel", "coal phaseout", "coal phase-out",
-    "electric grid", "clean electricity",
-}
-
-EXTREME_WEATHER_KEYWORDS = {
-    "heatwave", "heat wave", "wildfire", "drought", "flood", "flooding",
-    "cyclone", "hurricane", "typhoon", "storm surge", "extreme rainfall",
-    "extreme weather", "record heat", "marine heatwave", "severe storm",
-    "coastal flooding", "high swell", "tidal flooding",
-    "ފެންބޮޑުވުން", "ވައިގަދަ", "ސުނާމީ", "ކާރިސާ",
-}
-
-SCIENCE_KEYWORDS = {
-    "climate study", "environmental study", "researchers found",
-    "scientists found", "new study", "peer-reviewed", "research",
-    "scientist", "scientists", "monitoring", "satellite data",
-}
-
-POLICY_KEYWORDS = {
-    "climate policy", "environmental law", "environment law",
-    "climate finance", "green finance", "carbon market", "carbon tax",
-    "cop30", "cop31", "paris agreement", "loss and damage",
-    "environment ministry", "environment minister", "unep", "unfccc",
-}
-
-GENERAL_ENVIRONMENT_KEYWORDS = {
-    "environment", "environmental", "ecology", "ecological", "nature",
-    "sustainability", "sustainable", "conservation", "biodiversity",
-    "ecosystem", "pollution", "climate", "ocean", "marine", "coral",
-    "reef", "wildlife", "renewable", "emissions", "deforestation",
-    "mangrove", "waste", "plastic", "restoration",
-    "ތިމާވެށި", "ކަނޑު", "ފަރު", "ކޮރަލް", "ކުނި",
-}
-
-ALL_TOPIC_KEYWORDS = (
-    CLIMATE_KEYWORDS
-    | OCEAN_REEF_KEYWORDS
-    | BIODIVERSITY_KEYWORDS
-    | POLLUTION_WASTE_KEYWORDS
-    | CONSERVATION_KEYWORDS
-    | FOREST_KEYWORDS
-    | CLEAN_ENERGY_KEYWORDS
-    | EXTREME_WEATHER_KEYWORDS
-    | SCIENCE_KEYWORDS
-    | POLICY_KEYWORDS
-    | GENERAL_ENVIRONMENT_KEYWORDS
-)
-
-STRONG_ENVIRONMENT_PHRASES = {
-    "climate change", "global warming", "coral bleaching", "coral reef",
-    "reef restoration", "marine conservation", "ocean acidification",
-    "biodiversity loss", "plastic pollution", "renewable energy",
-    "energy transition", "sea level rise", "sea-level rise",
-    "coastal erosion", "climate finance", "environmental protection",
-    "marine protected area", "mangrove restoration", "extreme weather",
-    "marine heatwave", "ތިމާވެށި", "ކްލައިމެޓް",
-}
-
-IRRELEVANT_SIGNALS = {
-    "football", "cricket", "basketball", "tennis", "championship",
-    "celebrity", "movie", "film", "music", "fashion", "horoscope",
-    "recipe", "gaming", "smartphone launch", "stock market",
-    "cryptocurrency", "crypto price", "election campaign",
-}
-
-ENVIRONMENT_SOURCE_MARKERS = {
-    "environment", "climate", "mongabay", "carbon brief", "inside climate",
-}
-
-BREAKING_ENVIRONMENT_KEYWORDS = {
-    "tsunami", "cyclone", "hurricane", "typhoon", "wildfire",
-    "flash flood", "flooding", "storm surge", "marine heatwave",
-    "record heat", "mass bleaching", "oil spill", "chemical spill",
-    "evacuation", "environmental emergency", "ސުނާމީ", "ކާރިސާ",
-}
-
-
-# ============================================================
-# SAVED STATE
-# ============================================================
-
-DEFAULT_STATE = {
-    "seen_ids": [],
-    "history": [],
-    "telegram_offset": 0,
-    "last_news_check": None,
-    "last_morning_digest": None,
-    "last_evening_digest": None,
-    "ai_request_times": [],
-    "ai_disabled_until": None,
-}
-
-
-def load_state():
-    if not STATE_FILE.exists():
-        return DEFAULT_STATE.copy()
-
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as file:
-            saved_state = json.load(file)
-        result = DEFAULT_STATE.copy()
-        result.update(saved_state)
-        return result
-    except Exception as error:
-        logging.error("Could not load state: %s", error)
-        return DEFAULT_STATE.copy()
-
-
-state = load_state()
+_default_db = "/data/news_bot.sqlite3" if Path("/data").exists() else "news_bot.sqlite3"
+DB_PATH = Path(os.getenv("NEWS_DB_PATH", _default_db))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+DB_LOCK = threading.RLock()
+BOT_USERNAME = None
+RATE_MEMORY = {}
 
 
 def utc_now():
@@ -359,648 +60,688 @@ def maldives_now():
     return datetime.now(MALDIVES_TIMEZONE)
 
 
-def cleanup_state():
-    history_cutoff = utc_now() - timedelta(days=HISTORY_RETENTION_DAYS)
-    cleaned_history = []
-
-    for item in state.get("history", []):
-        try:
-            created_at = datetime.fromisoformat(item["created_at"])
-            if created_at >= history_cutoff:
-                cleaned_history.append(item)
-        except Exception:
-            continue
-
-    state["history"] = cleaned_history
-
-    hour_cutoff = utc_now() - timedelta(hours=1)
-    valid_ai_requests = []
-
-    for request_time in state.get("ai_request_times", []):
-        try:
-            parsed_time = datetime.fromisoformat(request_time)
-            if parsed_time >= hour_cutoff:
-                valid_ai_requests.append(request_time)
-        except Exception:
-            continue
-
-    state["ai_request_times"] = valid_ai_requests
-
-
-def save_state():
-    cleanup_state()
-    state["seen_ids"] = state.get("seen_ids", [])[-12000:]
-    state["history"] = state.get("history", [])[-2000:]
-    state["ai_request_times"] = state.get("ai_request_times", [])[-100:]
-
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as file:
-            json.dump(state, file, ensure_ascii=False, indent=2)
-    except Exception as error:
-        logging.error("Could not save state: %s", error)
-
-
-# ============================================================
-# TEXT AND ARTICLE HELPERS
-# ============================================================
-
 def clean_text(value):
     if not value:
         return ""
-
     text = str(value)
-    text = re.sub(r"<script.*?>.*?</script>", " ", text, flags=re.IGNORECASE | re.DOTALL)
-    text = re.sub(r"<style.*?>.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<script.*?>.*?</script>", " ", text, flags=re.I | re.S)
+    text = re.sub(r"<style.*?>.*?</style>", " ", text, flags=re.I | re.S)
     text = re.sub(r"<[^>]+>", " ", text)
     text = html.unescape(text)
     return re.sub(r"\s+", " ", text).strip()
 
 
-def shorten_text(text, maximum_length):
-    text = str(text)
-    if len(text) <= maximum_length:
-        return text
-    return text[:maximum_length].rstrip() + "..."
+def shorten_text(text, limit):
+    text = str(text or "")
+    return text if len(text) <= limit else text[: max(0, limit - 3)].rstrip() + "..."
 
 
-def split_sentences(text):
+def is_dhivehi_text(text):
+    text = clean_text(text)
+    if not text:
+        return False
+    thaana = len(re.findall(r"[\u0780-\u07BF]", text))
+    letters = len(re.findall(r"[A-Za-z\u0780-\u07BF]", text))
+    return thaana >= 3 and thaana / max(letters, 1) >= 0.18
+
+
+def split_sentences(text, language="en"):
     text = clean_text(text)
     if not text:
         return []
-    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", text)
-    return [sentence.strip() for sentence in sentences if len(sentence.strip()) >= 25]
+    if language == "dv":
+        parts = re.split(r"(?<=[.!?؟])\s+|\n+", text)
+    else:
+        parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])", text)
+    return [part.strip() for part in parts if len(part.strip()) >= 18]
+
+
+def contains_phrase(text, phrase):
+    text = text.lower()
+    phrase = phrase.lower().strip()
+    if not phrase:
+        return False
+    if re.search(r"[\u0780-\u07BF]", phrase):
+        return phrase in text
+    pattern = r"(?<![A-Za-z0-9])" + re.escape(phrase).replace(r"\ ", r"\s+") + r"(?![A-Za-z0-9])"
+    return re.search(pattern, text, flags=re.I) is not None
+
+
+def phrase_hits(text, phrases):
+    return sum(1 for phrase in phrases if contains_phrase(text, phrase))
 
-
-def article_hash(source, title, link):
-    value = f"{source}|{title}|{link}"
-    return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()
-
-
-def combined_article_text(article):
-    return " ".join(
-        [
-            article.get("source", ""),
-            article.get("publisher", ""),
-            article.get("title", ""),
-            article.get("description", ""),
-        ]
-    ).lower()
-
-
-def article_content_text(article):
-    """Title + description only, so feed labels cannot make a story relevant."""
-    return " ".join(
-        [
-            article.get("title", ""),
-            article.get("description", ""),
-        ]
-    ).lower()
-
-
-def count_keyword_hits(text, keywords):
-    return sum(1 for keyword in keywords if keyword in text)
-
-
-def is_maldives_story(article):
-    text = combined_article_text(article)
-    return any(marker in text for marker in MALDIVES_MARKERS) or "🇲🇻" in article.get("source", "")
-
-
-def is_dhivehi_story(article):
-    text = combined_article_text(article)
-    matches = re.findall(r"[\u0780-\u07BF]", text)
-    return bool(text) and len(matches) / max(len(text), 1) > 0.05
-
-
-def environmental_relevance_score(article):
-    text = article_content_text(article)
-
-    strong_hits = count_keyword_hits(text, STRONG_ENVIRONMENT_PHRASES)
-    topic_hits = count_keyword_hits(text, ALL_TOPIC_KEYWORDS)
-    irrelevant_hits = count_keyword_hits(text, IRRELEVANT_SIGNALS)
-
-    source = article.get("source", "").lower()
-    source_bonus = 2 if any(marker in source for marker in ENVIRONMENT_SOURCE_MARKERS) else 0
-    maldives_bonus = 1 if is_maldives_story(article) else 0
-
-    score = strong_hits * 4 + min(topic_hits, 6) * 2 + source_bonus + maldives_bonus
-    score -= min(irrelevant_hits * 4, 12)
-
-    return max(0, score)
-
-
-def is_environment_story(article):
-    text = article_content_text(article)
-
-    # One strong phrase is enough. Otherwise require multiple topic signals.
-    if any(phrase in text for phrase in STRONG_ENVIRONMENT_PHRASES):
-        return True
-
-    topic_hits = count_keyword_hits(text, ALL_TOPIC_KEYWORDS)
-    if topic_hits >= 2:
-        return True
-
-    source = article.get("source", "").lower()
-    if any(marker in source for marker in ENVIRONMENT_SOURCE_MARKERS) and topic_hits >= 1:
-        return True
-
-    return False
-
-
-def detect_category(article):
-    text = article_content_text(article)
-
-    scores = {
-        "Climate Change": count_keyword_hits(text, CLIMATE_KEYWORDS),
-        "Extreme Weather": count_keyword_hits(text, EXTREME_WEATHER_KEYWORDS),
-        "Oceans & Reefs": count_keyword_hits(text, OCEAN_REEF_KEYWORDS),
-        "Biodiversity & Wildlife": count_keyword_hits(text, BIODIVERSITY_KEYWORDS),
-        "Pollution & Waste": count_keyword_hits(text, POLLUTION_WASTE_KEYWORDS),
-        "Conservation & Restoration": count_keyword_hits(text, CONSERVATION_KEYWORDS),
-        "Forests & Mangroves": count_keyword_hits(text, FOREST_KEYWORDS),
-        "Clean Energy": count_keyword_hits(text, CLEAN_ENERGY_KEYWORDS),
-        "Climate Policy & Finance": count_keyword_hits(text, POLICY_KEYWORDS),
-        "Science & Research": count_keyword_hits(text, SCIENCE_KEYWORDS),
-    }
-
-    category = max(scores, key=scores.get)
-    if scores[category] == 0:
-        category = "Environment"
-
-    if is_maldives_story(article):
-        # Keep topic-specific labels for strong topic stories, but clearly
-        # distinguish general Maldives environmental news.
-        if scores.get(category, 0) == 0:
-            return "Maldives Environment"
-
-    return category
-
-
-def is_breaking_story(article):
-    text = article_content_text(article)
-    return any(keyword in text for keyword in BREAKING_ENVIRONMENT_KEYWORDS)
-
-
-def calculate_importance(article):
-    if not is_environment_story(article):
-        return 0
-
-    text = article_content_text(article)
-    score = 35
-
-    score += min(environmental_relevance_score(article) * 3, 30)
-
-    if is_maldives_story(article):
-        score += 18
-
-    if is_breaking_story(article):
-        score += 18
-
-    if count_keyword_hits(text, {"coral bleaching", "sea level rise", "marine heatwave", "climate finance"}):
-        score += 7
-
-    return max(0, min(100, score))
-
-
-# ============================================================
-# RSS DOWNLOAD AND PARSING
-# ============================================================
-
-def download_rss_feed(source_name, feed_url):
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/120 Safari/537.36"
-        )
-    }
-
-    try:
-        response = requests.get(feed_url, headers=headers, timeout=20, allow_redirects=True)
-        response.raise_for_status()
-        return feedparser.parse(response.content)
-    except Exception as error:
-        logging.debug("RSS feed unavailable — %s: %s", source_name, error)
-        return None
-
-
-def parse_rss_entry(source_name, entry):
-    title = clean_text(entry.get("title", "Untitled report"))
-    link = entry.get("link") or entry.get("id")
-
-    if not link or len(title) < 8:
-        return None
-
-    description = clean_text(
-        entry.get("summary")
-        or entry.get("description")
-        or entry.get("subtitle")
-        or title
-    )
-
-    article_id = entry.get("id") or entry.get("guid") or article_hash(source_name, title, link)
-
-    image = None
-    for item in entry.get("media_content", []) or []:
-        if isinstance(item, dict) and item.get("url"):
-            image = item["url"]
-            break
-
-    if not image:
-        for enclosure in entry.get("enclosures", []) or []:
-            if (
-                isinstance(enclosure, dict)
-                and enclosure.get("url")
-                and "image" in enclosure.get("type", "")
-            ):
-                image = enclosure["url"]
-                break
-
-    return {
-        "id": str(article_id),
-        "source": source_name,
-        "publisher": source_name,
-        "title": title,
-        "description": description,
-        "link": str(link),
-        "image": image,
-        "timestamp": entry.get("published", utc_now_iso()),
-    }
-
-
-def fetch_new_articles():
-    seen_ids = set(state.get("seen_ids", []))
-    collected_articles = []
-
-    all_feeds = {
-        **MALDIVES_RSS_FEEDS,
-        **MALDIVES_GOOGLE_FEEDS,
-        **GLOBAL_ENVIRONMENT_RSS,
-        **GLOBAL_GOOGLE_FEEDS,
-    }
-
-    ordered_feeds = sorted(
-        all_feeds.items(),
-        key=lambda item: (0 if "🇲🇻" in item[0] else 1, item[0]),
-    )
-
-    for source_name, feed_url in ordered_feeds:
-        feed = download_rss_feed(source_name, feed_url)
-        if not feed:
-            continue
-
-        max_entries = 12 if "🇲🇻" in source_name else 8
-
-        for entry in getattr(feed, "entries", [])[:max_entries]:
-            article = parse_rss_entry(source_name, entry)
-
-            if not article or article["id"] in seen_ids:
-                continue
-
-            # Mark every inspected article as seen so irrelevant general-news
-            # items from broad Maldivian feeds are not re-processed endlessly.
-            state.setdefault("seen_ids", []).append(article["id"])
-            seen_ids.add(article["id"])
-
-            if not is_environment_story(article):
-                logging.debug("Environment filter rejected: %s", article["title"])
-                continue
-
-            collected_articles.append(article)
-
-    logging.info("Collected %s new climate/environment articles.", len(collected_articles))
-    return collected_articles
-
-
-# ============================================================
-# DUPLICATE STORY MERGING
-# ============================================================
 
 def normalize_title(title):
-    normalized = clean_text(title).lower()
-    normalized = re.sub(r"[^\w\s]", " ", normalized, flags=re.UNICODE)
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-
-    ignored_words = {
-        "breaking", "latest", "live", "update", "updates", "news",
-        "report", "reports", "says", "climate", "environment",
-    }
-    return " ".join(word for word in normalized.split() if word not in ignored_words)
+    title = clean_text(title).lower()
+    title = re.sub(r"[^\w\u0780-\u07BF\s]", " ", title, flags=re.UNICODE)
+    title = re.sub(r"\s+", " ", title).strip()
+    ignored = {"breaking", "latest", "live", "update", "updates", "news", "report", "reports", "says"}
+    return " ".join(word for word in title.split() if word not in ignored)
 
 
 def headline_similarity(first, second):
     first = normalize_title(first)
     second = normalize_title(second)
-
     if not first or not second:
         return 0.0
-
     sequence_score = SequenceMatcher(None, first, second).ratio()
-    first_words = set(first.split())
-    second_words = set(second.split())
-    word_score = (
-        len(first_words & second_words) / len(first_words | second_words)
-        if first_words and second_words
-        else 0.0
-    )
-    return max(sequence_score, word_score)
+    a, b = set(first.split()), set(second.split())
+    jaccard = len(a & b) / len(a | b) if a and b else 0.0
+    return max(sequence_score, jaccard)
 
 
-def cluster_articles(articles):
-    clusters = []
-
-    articles.sort(
-        key=lambda article: (
-            0 if is_maldives_story(article) else 1,
-            0 if is_breaking_story(article) else 1,
-            -calculate_importance(article),
-        )
-    )
-
-    for article in articles:
-        matching_cluster = None
-        highest_similarity = 0.0
-
-        for cluster in clusters:
-            representative = cluster["articles"][0]
-            similarity = headline_similarity(article["title"], representative["title"])
-
-            if similarity >= DUPLICATE_SIMILARITY_THRESHOLD and similarity > highest_similarity:
-                matching_cluster = cluster
-                highest_similarity = similarity
-
-        if matching_cluster:
-            matching_cluster["articles"].append(article)
-            matching_cluster["publishers"].add(article["publisher"])
-            if not matching_cluster.get("image") and article.get("image"):
-                matching_cluster["image"] = article["image"]
-        else:
-            clusters.append(
-                {
-                    "articles": [article],
-                    "publishers": {article["publisher"]},
-                    "image": article.get("image"),
-                }
-            )
-
-    return clusters
-
-
-# ============================================================
-# SUMMARIES AND OPTIONAL GEMINI ANALYSIS
-# ============================================================
-
-def local_summary(article, cluster_articles=None):
-    descriptions = [article.get("description", "")]
-    if cluster_articles:
-        descriptions.extend(item.get("description", "") for item in cluster_articles[1:3])
-
-    sentences = split_sentences(" ".join(descriptions))
-    selected = []
-
-    for sentence in sentences:
-        if sentence.lower() in {item.lower() for item in selected}:
-            continue
-        selected.append(shorten_text(sentence, 260))
-        if len(selected) == 2:
-            break
-
-    if not selected:
-        selected.append(shorten_text(article.get("title", ""), 240))
-
-    if len(selected) < 2:
-        selected.append("Open the original source below for the complete report.")
-
-    return selected[:2]
-
-
-def ai_is_in_cooldown():
-    disabled_until = state.get("ai_disabled_until")
-    if not disabled_until:
-        return False
-
+def canonicalize_url(url):
+    url = str(url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return url
     try:
-        if utc_now() < datetime.fromisoformat(disabled_until):
-            return True
+        parts = urlsplit(url)
+        kept = []
+        for key, value in parse_qsl(parts.query, keep_blank_values=True):
+            if key.lower().startswith("utm_") or key.lower() in {"fbclid", "gclid", "mc_cid", "mc_eid"}:
+                continue
+            kept.append((key, value))
+        return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), urlencode(kept), ""))
     except Exception:
-        pass
-
-    state["ai_disabled_until"] = None
-    return False
+        return url
 
 
-def ai_hourly_limit_reached():
-    cleanup_state()
-    return len(state.get("ai_request_times", [])) >= MAX_AI_REQUESTS_PER_HOUR
+def hash_value(*parts):
+    raw = "|".join(str(part or "") for part in parts)
+    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
 
 
-def record_ai_request():
-    state.setdefault("ai_request_times", []).append(utc_now_iso())
-    save_state()
-
-
-def activate_ai_cooldown():
-    state["ai_disabled_until"] = (
-        utc_now() + timedelta(minutes=AI_QUOTA_COOLDOWN_MINUTES)
-    ).isoformat()
-    save_state()
-
-
-def gemini_generate(prompt, max_tokens=600):
-    if not GEMINI_API_KEY or ai_is_in_cooldown() or ai_hourly_limit_reached():
-        return None
-
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent"
-    )
-    headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": max_tokens,
-            "responseMimeType": "application/json",
-        },
-    }
-
-    record_ai_request()
-
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=75)
-        if response.status_code == 429:
-            activate_ai_cooldown()
-            return None
-        if response.status_code != 200:
-            logging.error("Gemini error %s: %s", response.status_code, response.text[:500])
-            return None
-
-        candidates = response.json().get("candidates", [])
-        if not candidates:
-            return None
-
-        parts = candidates[0].get("content", {}).get("parts", [])
-        return "".join(part.get("text", "") for part in parts).strip() or None
-    except requests.RequestException as error:
-        logging.error("Gemini connection error: %s", error)
-        return None
-
-
-def extract_json_object(text):
-    if not text:
-        return None
-
-    text = re.sub(r"^```(?:json)?", "", text.strip(), flags=re.IGNORECASE)
-    text = re.sub(r"```$", "", text).strip()
-    start = text.find("{")
-    end = text.rfind("}")
-
-    if start == -1 or end == -1:
-        return None
-
-    try:
-        return json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-
-
-def should_use_ai(cluster, local_score, ai_used_this_check):
-    if not GEMINI_API_KEY:
-        return False
-    if ai_used_this_check >= MAX_AI_REQUESTS_PER_CHECK:
-        return False
-    if ai_is_in_cooldown():
-        return False
-
-    first_article = cluster["articles"][0]
+def google_news_feed(query, region="US", language="en"):
     return (
-        local_score >= MINIMUM_AI_SCORE
-        or (is_maldives_story(first_article) and local_score >= 70)
-        or is_breaking_story(first_article)
+        "https://news.google.com/rss/search?"
+        f"q={quote_plus(query)}&hl={language}&gl={region}&ceid={region}:{language}"
     )
 
 
-def analyze_cluster_with_ai(cluster):
-    reports = []
+MALDIVES_DOMAINS = [
+    "adhadhu.com", "adhives.mv", "aslu.com.mv", "asuruonline.com", "avas.mv", "cnm.mv",
+    "dhelionline.mv", "dhen.mv", "dhauru.com", "dhidaily.mv", "dhuvas.mv", "dhuvelionline.mv",
+    "edition.mv", "eki.mv", "fainuonline.com", "faragu.mv", "farudhun.com", "fiyaonline.com",
+    "fiyes.mv", "furathama.mv", "gaafu.mv", "gohkolhu.com", "halha.mv", "halinews.com",
+    "hathaavees.com", "havaasa.com", "heerasnews.com", "hiraas.com.mv", "hirinews.com", "hoara.mv",
+    "hurihaa.mv", "huvadhoomedia.com", "iruvanews.com", "iruvaru.com", "javiyani.mv", "jeeluonline.com",
+    "kaafu.mv", "keyolha.com", "khabaruonline.com", "maldivesindependent.com", "maletimes.mv",
+    "masverin.mv", "miadhu.mv", "mihaaru.com", "mikalnews.com", "milauthuru.com", "mmtv.mv",
+    "mulhiraajje.com", "muniavas.com", "muraasilu.mv", "mvrepublic.com", "naares.com", "oivaru.com",
+    "oneonline.mv", "psm.mv", "raajje.mv", "raajje24.com", "ras.mv", "sababu.mv", "sandhaanu.today",
+    "sangu.mv", "sarukaaru.gov.mv", "sauvees.com", "sun.mv", "suruhee.mv", "themirror.mv", "thepress.mv",
+    "thiladhun.com", "vaguthu.mv", "viraasee.com", "viyafaari.com.mv", "viyas.mv", "vnews.mv", "voice.mv",
+    "xeetimes.com",
+]
+MALDIVES_DOMAIN_SET = set(MALDIVES_DOMAINS)
 
-    for index, article in enumerate(cluster["articles"][:4], start=1):
-        reports.append(
-            f"""Report {index}
-Publisher: {article['publisher']}
-Headline: {article['title']}
-Description: {shorten_text(article['description'], 1300)}"""
+MAJOR_PUBLISHER_NAMES = {
+    "mihaaru.com": "Mihaaru", "dhauru.com": "Dhauru", "avas.mv": "Avas", "raajje.mv": "Raajje TV",
+    "vnews.mv": "VNews", "dhen.mv": "Dhen", "mmtv.mv": "MMTV", "edition.mv": "The Edition",
+    "maldivesindependent.com": "Maldives Independent", "mvrepublic.com": "MV Republic", "psm.mv": "PSM News",
+    "sun.mv": "Sun Online", "adhadhu.com": "Adhadhu", "miadhu.mv": "Miadhu", "vaguthu.mv": "Vaguthu",
+}
+
+DIRECT_MALDIVES_FEEDS = {
+    "Sun Online": "https://sun.mv/news/rss",
+    "PSM News": "https://psmnews.mv/feed",
+    "Adhadhu": "https://adhadhu.com/rss",
+    "Miadhu": "https://miadhu.com/feed",
+    "Dhiyares": "https://dhiyares.com/rss",
+    "VNews": "https://vnews.mv/rss",
+    "Times of Addu": "https://timesofaddu.com/feed",
+}
+
+GLOBAL_RSS_FEEDS = {
+    "BBC World": "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "The Guardian World": "https://www.theguardian.com/world/rss",
+    "Al Jazeera": "https://www.aljazeera.com/xml/rss/all.xml",
+    "NPR World": "https://feeds.npr.org/1004/rss.xml",
+    "NYT World": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+    "BBC Business": "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "BBC Technology": "https://feeds.bbci.co.uk/news/technology/rss.xml",
+    "BBC Health": "https://feeds.bbci.co.uk/news/health/rss.xml",
+    "BBC Entertainment": "https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml",
+    "BBC Sport": "https://feeds.bbci.co.uk/sport/rss.xml",
+    "CNBC World": "https://www.cnbc.com/id/100727362/device/rss/rss.html",
+    "TechCrunch": "https://techcrunch.com/feed/",
+    "NASA": "https://www.nasa.gov/news-release/feed/",
+}
+
+CATEGORY_EMOJIS = {
+    "Emergency": "🚨", "Politics": "🏛️", "Business": "💰", "Technology & AI": "💻",
+    "Health": "🏥", "Science": "🔬", "Travel & Tourism": "✈️", "Sports": "⚽",
+    "Entertainment": "🎬", "Crime & Courts": "⚖️", "Environment": "🌊", "General": "📰",
+}
+
+CATEGORY_KEYWORDS = {
+    "Politics": {"president", "prime minister", "parliament", "election", "government", "minister", "cabinet", "vote", "diplomatic", "constitution", "ރައީސް", "ވަޒީރު", "މަޖިލިސް", "އިންތިޚާބު", "ސަރުކާރު"},
+    "Business": {"economy", "inflation", "bank", "market", "stocks", "business", "trade", "investment", "finance", "gdp", "interest rate", "އިޤްތިޞާދު", "ވިޔަފާރި", "ފައިސާ", "ބޭންކު"},
+    "Technology & AI": {"technology", "artificial intelligence", "generative ai", "chatgpt", "openai", "gemini", "software", "cybersecurity", "internet", "semiconductor", "robot", "ޓެކްނޮލޮޖީ", "އޭއައި", "އިންޓަރނެޓް"},
+    "Health": {"health", "hospital", "disease", "virus", "outbreak", "vaccine", "medical", "doctor", "patient", "treatment", "medicine", "ޞިއްޙަތު", "ބަލި", "ހޮސްޕިޓަލް"},
+    "Science": {"science", "research", "scientist", "space", "nasa", "discovery", "study", "satellite", "ސައިންސް", "ދިރާސާ"},
+    "Travel & Tourism": {"travel", "tourism", "airport", "airline", "flight", "hotel", "resort", "visa", "passenger", "cruise", "ޓޫރިޒަމް", "މުސާފިރު", "ރިސޯޓް", "އެއަރޕޯޓް"},
+    "Sports": {"football", "soccer", "cricket", "tennis", "basketball", "futsal", "volleyball", "championship", "league", "tournament", "world cup", "olympics", "match", "goal", "ފުޓްބޯޅަ", "ކްރިކެޓް", "ސްޕޯޓް", "މެޗު", "ލީގު"},
+    "Entertainment": {"film", "movie", "music", "actor", "actress", "celebrity", "television", "concert", "award", "song", "album", "entertainment", "ފިލްމު", "މިއުޒިކް", "ޓީވީ"},
+    "Crime & Courts": {"police", "court", "crime", "arrested", "charged", "trial", "investigation", "prosecutor", "sentence", "murder", "robbery", "fraud", "ފުލުހުން", "ކޯޓު", "ހައްޔަރު", "ތަޙްޤީޤު"},
+    "Environment": {"environment", "climate", "ocean", "coral", "reef", "wildlife", "pollution", "conservation", "biodiversity", "marine", "plastic", "waste", "weather", "ތިމާވެށި", "ކަނޑު", "މޫދު", "ފަރު", "ކުނި"},
+}
+
+BREAKING_STRONG = {
+    "breaking", "urgent", "state of emergency", "earthquake", "tsunami", "cyclone", "hurricane", "typhoon",
+    "major flood", "flash flood", "explosion", "evacuation", "landslide", "terror attack", "missile attack",
+    "coup", "assassination", "ceasefire", "war", "airport closed", "mass casualty", "ބްރޭކިންގ", "ކާރިސާ", "ސުނާމީ", "ބިންހެލުން",
+}
+BREAKING_SUPPORT = {"killed", "dead", "injured", "warning", "alert", "emergency", "attack", "flood", "fire", "outbreak"}
+HIGH_IMPORTANCE = {"president", "prime minister", "government", "election", "parliament", "economy", "inflation", "interest rate", "supreme court", "central bank", "earthquake", "tsunami", "cyclone", "outbreak", "ރައީސް", "ސަރުކާރު", "އިންތިޚާބު", "މަޖިލިސް", "އިޤްތިޞާދު"}
+LOW_VALUE = {"horoscope", "recipe", "shopping", "sponsored", "advertisement", "promotion", "discount", "photo gallery", "quiz"}
+
+MALDIVES_LOCAL_MARKERS = {
+    "maldives", "maldivian", "malé", "male city", "hulhumale", "hulhumalé", "villimale", "addu", "fuvahmulah",
+    "kulhudhuffushi", "thinadhoo", "eydhafushi", "dharavandhoo", "hanifaru", "maafushi", "thulusdhoo", "dhigurah",
+    "hithadhoo", "naifaru", "fonadhoo", "kudahuvadhoo", "manadhoo", "ungoofaaru", "villingili", "baa atoll", "laamu atoll",
+    "gaafu", "kaafu atoll", "raa atoll", "noonu atoll", "shaviyani atoll", "lhaviyani atoll", "ari atoll", "meen atoll",
+    "ދިވެހިރާއްޖެ", "ރާއްޖެ", "މާލެ", "ހުޅުމާލެ", "އައްޑޫ", "ފުވައްމުލައް", "އޭދަފުށި", "ދަރަވަންދޫ",
+}
+MALDIVES_INSTITUTIONS = {
+    "people's majlis", "peoples majlis", "maldives police service", "mndf", "bank of maldives", "maldives monetary authority",
+    "maldives inland revenue", "mira", "macl", "mtcc", "stelco", "fenaka", "rufiyaa", "mvr", "president muizzu",
+    "ރުފިޔާ", "މަޖިލިސް", "އެމްއެންޑީއެފް", "ފުލުހުން",
+}
+FOREIGN_MARKERS = {
+    "yemen", "india", "sri lanka", "united kingdom", " uk ", "united states", "gaza", "israel", "ukraine", "russia",
+    "china", "pakistan", "bangladesh", "saudi arabia", "uae", "iran", "iraq", "nepal", "australia", "new zealand",
+    "france", "germany", "italy", "spain", "japan", "korea", "afghanistan", "myanmar", "sudan", "somalia",
+}
+
+SOURCE_QUALITY = {
+    "Reuters": 10, "Associated Press": 10, "AP News": 10, "BBC": 9, "BBC World": 9, "NPR": 9,
+    "New York Times": 9, "The Guardian": 8, "Al Jazeera": 8, "PSM News": 7, "Sun Online": 6,
+    "Mihaaru": 7, "Dhauru": 7, "Adhadhu": 7, "The Edition": 7, "Maldives Independent": 7,
+}
+
+
+def db_connect():
+    connection = sqlite3.connect(DB_PATH, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    return connection
+
+
+def init_db():
+    with DB_LOCK, db_connect() as db:
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            CREATE TABLE IF NOT EXISTS stories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                representative_title TEXT NOT NULL,
+                normalized_title TEXT NOT NULL,
+                category TEXT NOT NULL,
+                language TEXT NOT NULL,
+                maldives INTEGER NOT NULL DEFAULT 0,
+                story_location TEXT NOT NULL,
+                importance INTEGER NOT NULL DEFAULT 0,
+                breaking INTEGER NOT NULL DEFAULT 0,
+                low_value INTEGER NOT NULL DEFAULT 0,
+                primary_url TEXT NOT NULL,
+                primary_publisher TEXT NOT NULL,
+                publishers_json TEXT NOT NULL DEFAULT '[]',
+                article_count INTEGER NOT NULL DEFAULT 1,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                published_to_group INTEGER NOT NULL DEFAULT 0,
+                published_importance INTEGER NOT NULL DEFAULT 0,
+                published_breaking INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_stories_last_seen ON stories(last_seen DESC);
+            CREATE INDEX IF NOT EXISTS idx_stories_maldives_lang ON stories(maldives, language, last_seen DESC);
+            CREATE INDEX IF NOT EXISTS idx_stories_category ON stories(category, last_seen DESC);
+            CREATE TABLE IF NOT EXISTS articles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                article_uid TEXT UNIQUE NOT NULL,
+                story_id INTEGER NOT NULL,
+                source_feed TEXT NOT NULL,
+                publisher TEXT NOT NULL,
+                publisher_domain TEXT,
+                publisher_country TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT,
+                url TEXT NOT NULL,
+                canonical_url TEXT NOT NULL,
+                language TEXT NOT NULL,
+                category TEXT NOT NULL,
+                maldives INTEGER NOT NULL,
+                story_location TEXT NOT NULL,
+                importance INTEGER NOT NULL,
+                breaking INTEGER NOT NULL,
+                low_value INTEGER NOT NULL,
+                published_at TEXT,
+                fetched_at TEXT NOT NULL,
+                FOREIGN KEY(story_id) REFERENCES stories(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_articles_story ON articles(story_id);
+            CREATE INDEX IF NOT EXISTS idx_articles_fetched ON articles(fetched_at DESC);
+            CREATE TABLE IF NOT EXISTS source_health (
+                source_name TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                last_attempt TEXT,
+                last_success TEXT,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                article_count INTEGER NOT NULL DEFAULT 0,
+                response_ms INTEGER NOT NULL DEFAULT 0
+            );
+            """
         )
+        db.commit()
 
-    prompt = f"""
-You edit a climate and environmental news channel focused on the Maldives and the world.
 
-Return only one JSON object:
-{{
-  "headline": "Clear factual headline",
-  "summary": ["Sentence one", "Sentence two"],
-  "why_it_matters": "One short factual sentence",
-  "category": "Environment",
-  "breaking": false,
-  "importance_score": 80
-}}
+def get_setting(key, default=None):
+    with DB_LOCK, db_connect() as db:
+        row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
 
-Rules:
-1. Use only facts contained in the supplied reports.
-2. Do not add facts, causes, numbers, locations, or conclusions that are not stated.
-3. The story must be about climate change, environment, oceans, coral reefs,
-   biodiversity, wildlife, conservation, pollution, waste, forests, mangroves,
-   clean energy, environmental science, climate policy, or a major environmental hazard.
-4. Allowed categories: {", ".join(CATEGORY_EMOJIS.keys())}.
-5. Use exactly two concise summary sentences.
-6. "breaking" is true only for an urgent environmental or climate development.
-7. importance_score must be 0-100.
 
-Reports:
+def set_setting(key, value):
+    with DB_LOCK, db_connect() as db:
+        db.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+        db.commit()
 
-{chr(10).join(reports)}
-""".strip()
 
-    data = extract_json_object(gemini_generate(prompt))
-    if not data:
-        return None
+def cleanup_db():
+    cutoff = (utc_now() - timedelta(days=ARCHIVE_RETENTION_DAYS)).isoformat()
+    with DB_LOCK, db_connect() as db:
+        db.execute("DELETE FROM articles WHERE fetched_at < ?", (cutoff,))
+        db.execute("DELETE FROM stories WHERE last_seen < ?", (cutoff,))
+        db.commit()
 
-    summary = data.get("summary", [])
-    if not isinstance(summary, list):
-        return None
 
-    summary = [clean_text(item) for item in summary if clean_text(item)][:2]
-    if len(summary) != 2:
-        return None
-
-    category = clean_text(data.get("category", "Environment"))
-    if category not in CATEGORY_EMOJIS:
-        category = "Environment"
-
+def domain_from_url(url):
     try:
-        importance_score = int(data.get("importance_score", 75))
+        return urlsplit(str(url or "")).netloc.lower().removeprefix("www.")
     except Exception:
-        importance_score = 75
+        return ""
 
+
+def publisher_country_from_domain(domain):
+    domain = domain.lower().removeprefix("www.")
+    return "MV" if domain in MALDIVES_DOMAIN_SET or domain.endswith(".mv") else "OTHER"
+
+
+def publisher_from_entry(entry, source_name, direct_publisher=None):
+    source_obj = entry.get("source")
+    publisher = ""
+    publisher_url = ""
+    if isinstance(source_obj, dict):
+        publisher = clean_text(source_obj.get("title", ""))
+        publisher_url = str(source_obj.get("href") or source_obj.get("url") or "")
+    if direct_publisher:
+        publisher = direct_publisher
+    title = clean_text(entry.get("title", ""))
+    if not publisher and " - " in title:
+        left, right = title.rsplit(" - ", 1)
+        if 2 <= len(right) <= 80:
+            publisher = clean_text(right)
+            title = clean_text(left)
+    publisher = publisher or source_name
+    domain = domain_from_url(publisher_url)
+    return publisher, domain, title
+
+
+def detect_location(text, publisher_country):
+    lowered = f" {clean_text(text).lower()} "
+    local_hits = phrase_hits(lowered, MALDIVES_LOCAL_MARKERS) + phrase_hits(lowered, MALDIVES_INSTITUTIONS)
+    foreign_hits = phrase_hits(lowered, FOREIGN_MARKERS)
+    if local_hits > 0:
+        return "Maldives", True
+    if foreign_hits > 0:
+        return "Global", False
+    if publisher_country == "MV" and is_dhivehi_text(lowered):
+        return "Maldives", True
+    if publisher_country == "MV":
+        return "Maldives", True
+    return "Global", False
+
+
+def detect_category(text):
+    scores = {category: phrase_hits(text, words) for category, words in CATEGORY_KEYWORDS.items()}
+    best = max(scores, key=scores.get)
+    return best if scores[best] else "General"
+
+
+def is_breaking(text):
+    strong = phrase_hits(text, BREAKING_STRONG)
+    support = phrase_hits(text, BREAKING_SUPPORT)
+    if strong >= 1:
+        return True
+    return support >= 2 and contains_phrase(text, "emergency")
+
+
+def is_low_value(text):
+    return phrase_hits(text, LOW_VALUE) > 0
+
+
+def source_quality(publisher):
+    publisher_lower = publisher.lower()
+    best = 4
+    for name, score in SOURCE_QUALITY.items():
+        if name.lower() in publisher_lower:
+            best = max(best, score)
+    return best
+
+
+def calculate_importance(text, maldives, breaking, category, publisher):
+    score = 38
+    if maldives:
+        score += 10
+    if breaking:
+        score += 30
+    score += min(phrase_hits(text, HIGH_IMPORTANCE) * 5, 20)
+    score += max(0, source_quality(publisher) - 4)
+    if category in {"Politics", "Business", "Health", "Emergency"}:
+        score += 3
+    if is_low_value(text):
+        score -= 25
+    return max(0, min(100, score))
+
+
+def local_summary(title, description, language):
+    sentences = split_sentences(description, language)
+    if sentences:
+        result = [shorten_text(sentence, 260) for sentence in sentences[:2]]
+    else:
+        result = [shorten_text(description or title, 260)] if (description or title) else []
+    if len(result) < 2:
+        fallback = "ތަފްޞީލު ކިޔުމަށް އަސްލު ޚަބަރު ހުޅުވާ." if language == "dv" else "Open the original source for the full report."
+        result.append(fallback)
+    return result[:2]
+
+
+def parse_entry(source, entry):
+    publisher, publisher_domain, cleaned_title = publisher_from_entry(
+        entry, source["name"], source.get("publisher")
+    )
+    title = cleaned_title or clean_text(entry.get("title", ""))
+    link = str(entry.get("link") or entry.get("id") or "").strip()
+    if len(title) < 8 or not link.startswith(("http://", "https://")):
+        return None
+    description = clean_text(entry.get("summary") or entry.get("description") or entry.get("subtitle") or title)
+    canonical = canonicalize_url(link)
+    language = "dv" if is_dhivehi_text(f"{title} {description}") else "en"
+    domain = publisher_domain or domain_from_url(link)
+    publisher_country = source.get("publisher_country") or publisher_country_from_domain(domain)
+    location, maldives = detect_location(f"{title} {description}", publisher_country)
+    category = detect_category(f"{title} {description}")
+    breaking = is_breaking(f"{title} {description}")
+    low_value = is_low_value(f"{title} {description}")
+    importance = calculate_importance(f"{title} {description}", maldives, breaking, category, publisher)
+    article_uid = hash_value(publisher, normalize_title(title), canonical)
     return {
-        "headline": clean_text(data.get("headline", cluster["articles"][0]["title"])),
-        "summary": summary,
-        "why_it_matters": clean_text(data.get("why_it_matters", "")),
+        "article_uid": article_uid,
+        "source_feed": source["name"],
+        "publisher": publisher,
+        "publisher_domain": domain,
+        "publisher_country": publisher_country,
+        "title": title,
+        "description": description,
+        "url": link,
+        "canonical_url": canonical,
+        "language": language,
         "category": category,
-        "breaking": bool(data.get("breaking", False)),
-        "importance_score": max(0, min(100, importance_score)),
-        "used_ai": True,
+        "maldives": 1 if maldives else 0,
+        "story_location": location,
+        "importance": importance,
+        "breaking": 1 if breaking else 0,
+        "low_value": 1 if low_value else 0,
+        "published_at": clean_text(entry.get("published") or entry.get("updated") or ""),
+        "fetched_at": utc_now_iso(),
+        "summary": local_summary(title, description, language),
     }
 
 
-def local_cluster_analysis(cluster, local_score):
-    first_article = cluster["articles"][0]
-    return {
-        "headline": first_article["title"],
-        "summary": local_summary(first_article, cluster["articles"]),
-        "why_it_matters": "",
-        "category": (
-            "Maldives Environment"
-            if is_maldives_story(first_article) and detect_category(first_article) == "Environment"
-            else detect_category(first_article)
-        ),
-        "breaking": is_breaking_story(first_article),
-        "importance_score": local_score,
-        "used_ai": False,
+def build_sources():
+    sources = []
+    for name, url in DIRECT_MALDIVES_FEEDS.items():
+        sources.append({"name": f"MV Direct · {name}", "url": url, "publisher": name, "publisher_country": "MV", "max_entries": 18})
+    for index in range(0, len(MALDIVES_DOMAINS), 6):
+        group = MALDIVES_DOMAINS[index : index + 6]
+        site_query = "(" + " OR ".join(f"site:{domain}" for domain in group) + ") when:3d"
+        number = index // 6 + 1
+        sources.append({"name": f"MV Outlets EN {number:02d}", "url": google_news_feed(site_query, "US", "en"), "max_entries": 20})
+        sources.append({"name": f"MV Outlets DV {number:02d}", "url": google_news_feed(site_query, "MV", "dv"), "max_entries": 20})
+    broad_local = {
+        "MV Broad EN": google_news_feed("Maldives latest news when:2d", "US", "en"),
+        "MV Broad DV": google_news_feed("ރާއްޖެ ނޫސް when:2d", "MV", "dv"),
+        "MV Politics EN": google_news_feed("Maldives government parliament election when:3d", "US", "en"),
+        "MV Business EN": google_news_feed("Maldives economy business tourism finance when:3d", "US", "en"),
+        "MV Sports EN": google_news_feed("Maldives sports football futsal when:3d", "US", "en"),
+        "MV Health EN": google_news_feed("Maldives health hospital medical when:3d", "US", "en"),
     }
+    for name, url in broad_local.items():
+        sources.append({"name": name, "url": url, "max_entries": 20})
+    for name, url in GLOBAL_RSS_FEEDS.items():
+        sources.append({"name": f"Global · {name}", "url": url, "publisher": name, "publisher_country": "OTHER", "max_entries": 12})
+    global_searches = {
+        "Global Breaking": "breaking world news when:12h",
+        "Global Reuters": "site:reuters.com world news when:24h",
+        "Global AP": "site:apnews.com world news when:24h",
+        "Global Politics": "world politics government election diplomacy when:24h",
+        "Global Business": "business economy markets finance when:24h",
+        "Global Technology": "technology AI cybersecurity software when:24h",
+        "Global Sports": "sports football cricket tennis when:12h",
+        "Global Entertainment": "entertainment film music television when:24h",
+        "Global Health": "health medicine disease outbreak when:24h",
+        "Global Science": "science research space discovery when:24h",
+        "Global Travel": "travel tourism airline airport when:24h",
+        "Global Environment": "environment climate wildlife ocean when:24h",
+        "Global Crime": "crime court police investigation world when:24h",
+    }
+    for name, query in global_searches.items():
+        sources.append({"name": name, "url": google_news_feed(query, "US", "en"), "max_entries": 12})
+    return sources
 
 
-# ============================================================
-# TELEGRAM API AND POST FORMAT
-# ============================================================
+SOURCES = build_sources()
+
+
+def record_health(source, success, count, elapsed_ms, error=""):
+    now = utc_now_iso()
+    with DB_LOCK, db_connect() as db:
+        existing = db.execute("SELECT consecutive_failures FROM source_health WHERE source_name=?", (source["name"],)).fetchone()
+        failures = 0 if success else ((existing["consecutive_failures"] if existing else 0) + 1)
+        db.execute(
+            """
+            INSERT INTO source_health(source_name,url,last_attempt,last_success,consecutive_failures,last_error,article_count,response_ms)
+            VALUES(?,?,?,?,?,?,?,?)
+            ON CONFLICT(source_name) DO UPDATE SET
+                url=excluded.url,last_attempt=excluded.last_attempt,
+                last_success=CASE WHEN ? THEN excluded.last_success ELSE source_health.last_success END,
+                consecutive_failures=excluded.consecutive_failures,last_error=excluded.last_error,
+                article_count=excluded.article_count,response_ms=excluded.response_ms
+            """,
+            (source["name"], source["url"], now, now if success else None, failures, error[:300], count, elapsed_ms, 1 if success else 0),
+        )
+        db.commit()
+
+
+def fetch_source(source):
+    start = time.monotonic()
+    try:
+        response = requests.get(
+            source["url"],
+            headers={"User-Agent": "Mozilla/5.0 NewsBot/4.0"},
+            timeout=(5, 15),
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+        feed = feedparser.parse(response.content)
+        articles = []
+        for entry in list(getattr(feed, "entries", []) or [])[: source.get("max_entries", 12)]:
+            article = parse_entry(source, entry)
+            if article:
+                articles.append(article)
+        elapsed = int((time.monotonic() - start) * 1000)
+        record_health(source, True, len(articles), elapsed)
+        return articles
+    except Exception as error:
+        elapsed = int((time.monotonic() - start) * 1000)
+        record_health(source, False, 0, elapsed, str(error))
+        logging.debug("Source failed %s: %s", source["name"], error)
+        return []
+
+
+def fetch_all_articles():
+    articles = []
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
+        futures = [executor.submit(fetch_source, source) for source in SOURCES]
+        for future in as_completed(futures):
+            try:
+                articles.extend(future.result())
+            except Exception as error:
+                logging.warning("Fetch worker failed: %s", error)
+    logging.info("Fetched %s valid articles from %s sources", len(articles), len(SOURCES))
+    return articles
+
+
+def find_matching_story(db, article):
+    exact = db.execute("SELECT story_id FROM articles WHERE canonical_url=? LIMIT 1", (article["canonical_url"],)).fetchone()
+    if exact:
+        return exact["story_id"]
+    cutoff = (utc_now() - timedelta(days=7)).isoformat()
+    rows = db.execute(
+        "SELECT id,representative_title,language,maldives,story_location FROM stories WHERE last_seen>=? ORDER BY last_seen DESC LIMIT 350",
+        (cutoff,),
+    ).fetchall()
+    for row in rows:
+        if row["language"] != article["language"]:
+            continue
+        if int(row["maldives"]) != int(article["maldives"]):
+            continue
+        if row["story_location"] != article["story_location"]:
+            continue
+        if headline_similarity(article["title"], row["representative_title"]) >= 0.78:
+            return row["id"]
+    return None
+
+
+def archive_article(article):
+    with DB_LOCK, db_connect() as db:
+        exists = db.execute("SELECT id,story_id FROM articles WHERE article_uid=?", (article["article_uid"],)).fetchone()
+        if exists:
+            return exists["story_id"], False
+        story_id = find_matching_story(db, article)
+        now = article["fetched_at"]
+        if story_id is None:
+            publishers = json.dumps([article["publisher"]], ensure_ascii=False)
+            cursor = db.execute(
+                """
+                INSERT INTO stories(representative_title,normalized_title,category,language,maldives,story_location,
+                    importance,breaking,low_value,primary_url,primary_publisher,publishers_json,article_count,first_seen,last_seen)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    article["title"], normalize_title(article["title"]), article["category"], article["language"], article["maldives"],
+                    article["story_location"], article["importance"], article["breaking"], article["low_value"], article["url"],
+                    article["publisher"], publishers, 1, now, now,
+                ),
+            )
+            story_id = cursor.lastrowid
+        else:
+            row = db.execute("SELECT publishers_json,importance,breaking,low_value FROM stories WHERE id=?", (story_id,)).fetchone()
+            publishers = set(json.loads(row["publishers_json"] or "[]"))
+            publishers.add(article["publisher"])
+            db.execute(
+                """
+                UPDATE stories SET last_seen=?, article_count=article_count+1,
+                    importance=MAX(importance,?), breaking=MAX(breaking,?), low_value=MIN(low_value,?),
+                    publishers_json=? WHERE id=?
+                """,
+                (now, article["importance"], article["breaking"], article["low_value"], json.dumps(sorted(publishers), ensure_ascii=False), story_id),
+            )
+        db.execute(
+            """
+            INSERT INTO articles(article_uid,story_id,source_feed,publisher,publisher_domain,publisher_country,title,description,url,
+                canonical_url,language,category,maldives,story_location,importance,breaking,low_value,published_at,fetched_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                article["article_uid"], story_id, article["source_feed"], article["publisher"], article["publisher_domain"],
+                article["publisher_country"], article["title"], article["description"], article["url"], article["canonical_url"],
+                article["language"], article["category"], article["maldives"], article["story_location"], article["importance"],
+                article["breaking"], article["low_value"], article["published_at"], article["fetched_at"],
+            ),
+        )
+        db.commit()
+        return story_id, True
+
+
+def archive_articles(articles):
+    changed_story_ids = set()
+    new_articles = 0
+    for article in articles:
+        story_id, created = archive_article(article)
+        if created:
+            changed_story_ids.add(story_id)
+            new_articles += 1
+    logging.info("Archived %s new articles into %s changed stories", new_articles, len(changed_story_ids))
+    return changed_story_ids
+
+
+def story_rows_by_ids(ids):
+    if not ids:
+        return []
+    marks = ",".join("?" for _ in ids)
+    with DB_LOCK, db_connect() as db:
+        return db.execute(f"SELECT * FROM stories WHERE id IN ({marks})", tuple(ids)).fetchall()
+
+
+def story_summary(story_id):
+    with DB_LOCK, db_connect() as db:
+        row = db.execute(
+            "SELECT title,description,language FROM articles WHERE story_id=? ORDER BY importance DESC,id ASC LIMIT 1",
+            (story_id,),
+        ).fetchone()
+    if not row:
+        return ["Open the original source for the full report.", ""]
+    return local_summary(row["title"], row["description"], row["language"])
+
+
+def publishers_for_story(row):
+    try:
+        return list(json.loads(row["publishers_json"] or "[]"))
+    except Exception:
+        return [row["primary_publisher"]]
+
 
 def telegram_api(method, payload=None, timeout=40):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-
+    if not TELEGRAM_BOT_TOKEN:
+        return None
     try:
-        response = requests.post(url, json=payload or {}, timeout=timeout)
-        try:
-            result = response.json()
-        except Exception:
-            logging.error("Telegram returned invalid JSON: %s", response.text[:500])
+        response = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}", json=payload or {}, timeout=timeout
+        )
+        data = response.json()
+        if response.status_code != 200 or not data.get("ok"):
+            logging.error("Telegram %s error: %s", method, data.get("description", response.text[:300]))
             return None
-
-        if response.status_code != 200 or not result.get("ok"):
-            logging.error(
-                "Telegram %s error: %s",
-                method,
-                result.get("description", response.text[:500]),
-            )
-            return None
-
-        return result.get("result")
-    except requests.RequestException as error:
+        return data.get("result")
+    except Exception as error:
         logging.error("Telegram connection error: %s", error)
         return None
 
 
-def send_message(text, chat_id=GROUP_CHAT_ID, disable_preview=False, reply_markup=None):
+def send_message(text, chat_id=None, reply_markup=None, disable_preview=True):
     payload = {
-        "chat_id": str(chat_id),
-        "text": shorten_text(text, 4000),
+        "chat_id": str(chat_id or GROUP_CHAT_ID),
+        "text": str(text)[:4000],
         "parse_mode": "HTML",
         "disable_web_page_preview": disable_preview,
     }
@@ -1009,503 +750,477 @@ def send_message(text, chat_id=GROUP_CHAT_ID, disable_preview=False, reply_marku
     return telegram_api("sendMessage", payload)
 
 
-def send_photo(photo_url, caption, chat_id=GROUP_CHAT_ID, reply_markup=None):
-    payload = {
-        "chat_id": str(chat_id),
-        "photo": photo_url,
-        "caption": shorten_text(caption, 1000),
-        "parse_mode": "HTML",
-    }
+def edit_message(chat_id, message_id, text, reply_markup=None):
+    payload = {"chat_id": str(chat_id), "message_id": message_id, "text": str(text)[:4000], "parse_mode": "HTML", "disable_web_page_preview": True}
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    return telegram_api("sendPhoto", payload)
+    return telegram_api("editMessageText", payload)
 
 
-def build_source_buttons(cluster):
-    buttons = []
-    added_links = set()
-
-    for article in cluster.get("articles", [])[:5]:
-        link = article.get("link")
-        publisher = article.get("publisher", "Original source")
-
-        if (
-            not link
-            or link in added_links
-            or not link.startswith(("http://", "https://"))
-        ):
-            continue
-
-        added_links.add(link)
-        buttons.append(
-            {
-                "text": shorten_text(f"🔗 Read on {publisher}", 45),
-                "url": link,
-            }
-        )
-
-    return {"inline_keyboard": [[button] for button in buttons]} if buttons else None
+def bot_username():
+    global BOT_USERNAME
+    if BOT_USERNAME:
+        return BOT_USERNAME
+    info = telegram_api("getMe")
+    if isinstance(info, dict):
+        BOT_USERNAME = str(info.get("username") or "").strip().lstrip("@")
+    return BOT_USERNAME
 
 
-def public_command_keyboard():
+def main_keyboard():
     return {
         "keyboard": [
-            [{"text": "📰 Latest"}, {"text": "🔥 Trending"}],
-            [{"text": "🇲🇻 Maldives"}, {"text": "🌍 Global"}],
-            [{"text": "🌡️ Climate"}, {"text": "🌊 Oceans & Reefs"}],
-            [{"text": "🦋 Wildlife"}, {"text": "♻️ Pollution & Waste"}],
-            [{"text": "🌱 Conservation"}, {"text": "⚡ Clean Energy"}],
-            [{"text": "❓ Help"}],
+            [{"text": "🇲🇻 Maldives"}, {"text": "🌍 Global"}, {"text": "🚨 Important"}],
+            [{"text": "🧭 News Topics"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
         "one_time_keyboard": False,
-        "input_field_placeholder": "Choose a climate/environment section...",
+        "input_field_placeholder": "Choose Maldives, Global, Important or News Topics...",
     }
 
 
-PUBLIC_COMMANDS = [
-    {"command": "help", "description": "Show the climate & environment menu"},
-    {"command": "latest", "description": "Latest climate & environment news"},
-    {"command": "trending", "description": "Most reported environmental stories"},
-    {"command": "maldives", "description": "Maldives climate & environment news"},
-    {"command": "global", "description": "Global climate & environment news"},
-    {"command": "climate", "description": "Climate change and extreme weather"},
-    {"command": "oceans", "description": "Ocean, coral reef and marine news"},
-    {"command": "wildlife", "description": "Biodiversity and wildlife news"},
-    {"command": "pollution", "description": "Pollution, plastics and waste"},
-    {"command": "conservation", "description": "Conservation and restoration"},
-    {"command": "energy", "description": "Renewable and clean energy"},
-    {"command": "search", "description": "Search recent environmental stories"},
-]
+def topics_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "🚨 Breaking"}, {"text": "🏛️ Politics"}],
+            [{"text": "💰 Business"}, {"text": "💻 Technology & AI"}],
+            [{"text": "⚽ Sports"}, {"text": "🎬 Entertainment"}],
+            [{"text": "🏥 Health"}, {"text": "🔬 Science"}],
+            [{"text": "✈️ Travel & Tourism"}, {"text": "🌊 Environment"}],
+            [{"text": "⚖️ Crime & Courts"}, {"text": "📰 Latest"}],
+            [{"text": "⬅️ Main Menu"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+        "one_time_keyboard": False,
+        "input_field_placeholder": "Choose a news topic...",
+    }
 
 
-def register_public_commands():
-    return telegram_api("setMyCommands", {"commands": PUBLIC_COMMANDS})
+def private_destination(message):
+    chat_id = (message.get("chat") or {}).get("id")
+    sender_id = (message.get("from") or {}).get("id")
+    from_group = sender_id is not None and chat_id is not None and str(sender_id) != str(chat_id)
+    return (sender_id if from_group else chat_id), chat_id, from_group
 
 
-def calculate_trending_score(cluster, analysis):
-    score = analysis["importance_score"] * 0.62
-    score += min(len(cluster["publishers"]) * 11, 30)
+def rate_allowed(user_id):
+    if user_id is None:
+        return True
+    key = str(user_id)
+    now = time.time()
+    bucket = [stamp for stamp in RATE_MEMORY.get(key, []) if now - stamp <= USER_REQUEST_WINDOW_SECONDS]
+    if len(bucket) >= USER_REQUEST_LIMIT:
+        RATE_MEMORY[key] = bucket
+        return False
+    bucket.append(now)
+    RATE_MEMORY[key] = bucket
+    return True
 
-    if analysis["breaking"]:
-        score += 10
-    if is_maldives_story(cluster["articles"][0]):
-        score += 8
 
-    return min(100, round(score))
+def deep_link_markup(payload):
+    username = bot_username()
+    if not username:
+        return None
+    return {"inline_keyboard": [[{"text": "📩 Open Private News", "url": f"https://t.me/{username}?start={payload}"}]]}
 
 
-def build_news_message(cluster, analysis, trend_score):
-    category = analysis["category"]
-    emoji = CATEGORY_EMOJIS.get(category, "🌍")
-    first_article = cluster["articles"][0]
-
-    heading = ""
-    if analysis["breaking"]:
-        heading = "🚨 <b>ENVIRONMENT ALERT</b>\n\n"
-    elif trend_score >= 84:
-        heading = "🔥 <b>TRENDING ENVIRONMENT STORY</b>\n\n"
-
-    region = "🇲🇻 Maldives" if is_maldives_story(first_article) else "🌍 Global"
-    language = " · Dhivehi" if is_dhivehi_story(first_article) else ""
-
-    message = (
-        f"{heading}"
-        f"{emoji} <b>{html.escape(category)}</b> · {region}{language}\n\n"
-        f"📰 <b>{html.escape(analysis['headline'])}</b>\n\n"
-        f"• {html.escape(analysis['summary'][0])}\n"
-        f"• {html.escape(analysis['summary'][1])}\n"
-    )
-
-    if analysis.get("why_it_matters"):
-        message += (
-            "\n💡 <b>Why it matters:</b>\n"
-            f"{html.escape(analysis['why_it_matters'])}\n"
+def send_private(message, text, reply_markup=None, start_payload="menu"):
+    destination, origin_chat_id, from_group = private_destination(message)
+    if destination is None:
+        return None
+    if not rate_allowed(destination):
+        return send_message("⏳ Too many requests. Please wait a moment and try again.", destination, main_keyboard())
+    result = send_message(text, destination, reply_markup or main_keyboard())
+    if result:
+        return result
+    if from_group and origin_chat_id is not None:
+        markup = deep_link_markup(start_payload)
+        instruction = (
+            "📩 <b>Open your private news chat</b>\n\n"
+            "Telegram requires you to press <b>Start</b> once before I can send private news. "
+            "Tap the button below. Your original request will open automatically after Start."
         )
-
-    publishers = html.escape(", ".join(sorted(cluster["publishers"])))
-    message += (
-        f"\n📊 <b>Trending score:</b> {trend_score}/100\n"
-        f"🏢 <b>Sources:</b> {publishers}\n\n"
-        "👇 Open the original reporting below."
-    )
-
-    if len(cluster["articles"]) > 1:
-        message += f"\n\n🧩 Combined from {len(cluster['articles'])} related reports."
-
-    return message
+        return send_message(instruction, origin_chat_id, markup)
+    return None
 
 
-def publish_post(message, image_url=None, source_buttons=None):
-    if image_url:
-        result = send_photo(image_url, message, reply_markup=source_buttons)
-        if result:
-            return result
-        logging.warning("Image failed; falling back to text post.")
-
-    return send_message(message, reply_markup=source_buttons)
-
-
-# ============================================================
-# HISTORY
-# ============================================================
-
-def save_to_history(cluster, analysis, trend_score):
-    first_article = cluster["articles"][0]
-    state.setdefault("history", []).append(
-        {
-            "created_at": utc_now_iso(),
-            "headline": analysis["headline"],
-            "summary": analysis["summary"],
-            "category": analysis["category"],
-            "breaking": analysis["breaking"],
-            "importance_score": analysis["importance_score"],
-            "trending_score": trend_score,
-            "publishers": sorted(cluster["publishers"]),
-            "link": first_article["link"],
-            "maldives": is_maldives_story(first_article),
-            "dhivehi": is_dhivehi_story(first_article),
-            "used_ai": analysis["used_ai"],
+def query_stories(kind, page=0, language=None, page_size=PRIVATE_PAGE_SIZE):
+    where = []
+    params = []
+    if kind == "maldives":
+        where.append("maldives=1")
+    elif kind == "global":
+        where.append("maldives=0")
+    elif kind == "important":
+        where.append("(breaking=1 OR importance>=75)")
+    elif kind == "breaking":
+        where.append("breaking=1")
+    elif kind in {"politics", "business", "technology", "sports", "entertainment", "health", "science", "travel", "environment", "crime"}:
+        mapping = {
+            "politics": "Politics", "business": "Business", "technology": "Technology & AI", "sports": "Sports",
+            "entertainment": "Entertainment", "health": "Health", "science": "Science", "travel": "Travel & Tourism",
+            "environment": "Environment", "crime": "Crime & Courts",
         }
+        where.append("category=?")
+        params.append(mapping[kind])
+    if language in {"en", "dv"}:
+        where.append("language=?")
+        params.append(language)
+    cutoff = (utc_now() - timedelta(days=ARCHIVE_RETENTION_DAYS)).isoformat()
+    where.append("last_seen>=?")
+    params.append(cutoff)
+    clause = " AND ".join(where) if where else "1=1"
+    order = "breaking DESC, importance DESC, last_seen DESC" if kind in {"important", "breaking"} else "last_seen DESC, importance DESC"
+    offset = max(0, page) * page_size
+    with DB_LOCK, db_connect() as db:
+        total = db.execute(f"SELECT COUNT(*) AS c FROM stories WHERE {clause}", tuple(params)).fetchone()["c"]
+        rows = db.execute(
+            f"SELECT * FROM stories WHERE {clause} ORDER BY {order} LIMIT ? OFFSET ?",
+            tuple(params + [page_size, offset]),
+        ).fetchall()
+    return rows, total
+
+
+def format_story_page(title, kind, rows, total, page, language=None):
+    total_pages = max(1, (total + PRIVATE_PAGE_SIZE - 1) // PRIVATE_PAGE_SIZE)
+    page = min(max(page, 0), total_pages - 1)
+    message = f"📰 <b>{html.escape(title)}</b> · Page {page + 1}/{total_pages}\n\n"
+    if not rows:
+        message += "No matching stories are stored yet. The archive refreshes automatically every few minutes."
+        return message, None
+    start = page * PRIVATE_PAGE_SIZE + 1
+    for index, row in enumerate(rows, start=start):
+        emoji = CATEGORY_EMOJIS.get(row["category"], "📰")
+        headline = html.escape(row["representative_title"])
+        url = html.escape(row["primary_url"], quote=True)
+        publisher = html.escape(row["primary_publisher"])
+        region = "🇲🇻" if row["maldives"] else "🌍"
+        lang = "DV" if row["language"] == "dv" else "EN"
+        block = (
+            f'{index}. {region} {emoji} <a href="{url}">{headline}</a>\n'
+            f"   {publisher} · {html.escape(row['category'])} · 🌐 {lang} · 📊 {row['importance']}/100\n\n"
+        )
+        if len(message) + len(block) > 3600:
+            break
+        message += block
+    buttons = []
+    nav = []
+    lang_code = language or "all"
+    if page > 0:
+        nav.append({"text": "⬅️ Previous", "callback_data": f"page|{kind}|{lang_code}|{page-1}"})
+    if page + 1 < total_pages:
+        nav.append({"text": "Next ➡️", "callback_data": f"page|{kind}|{lang_code}|{page+1}"})
+    if nav:
+        buttons.append(nav)
+    if kind == "maldives":
+        buttons.append([
+            {"text": "🇬🇧 English", "callback_data": "page|maldives|en|0"},
+            {"text": "🇲🇻 Dhivehi", "callback_data": "page|maldives|dv|0"},
+        ])
+    return message.rstrip(), ({"inline_keyboard": buttons} if buttons else None)
+
+
+def title_for_kind(kind, language=None):
+    titles = {
+        "maldives": "Maldives News", "global": "Global News", "important": "Important News", "breaking": "Breaking & Urgent News",
+        "politics": "Politics", "business": "Business & Economy", "technology": "Technology & AI", "sports": "Sports",
+        "entertainment": "Entertainment", "health": "Health", "science": "Science & Research", "travel": "Travel & Tourism",
+        "environment": "Environment & Climate", "crime": "Crime & Courts", "latest": "Latest News",
+    }
+    title = titles.get(kind, "News")
+    if kind == "maldives" and language == "en":
+        title = "🇬🇧 Maldives News — English"
+    elif kind == "maldives" and language == "dv":
+        title = "🇲🇻 ދިވެހި ނޫސް"
+    return title
+
+
+def send_kind_page(message, kind, page=0, language=None):
+    rows, total = query_stories(kind, page, language)
+    text, markup = format_story_page(title_for_kind(kind, language), kind, rows, total, page, language)
+    return send_private(message, text, markup or main_keyboard(), start_payload=f"view_{kind}_{language or 'all'}")
+
+
+def send_maldives_bilingual(message):
+    intro = send_private(
+        message,
+        "🇲🇻 <b>Maldives News Archive</b>\n\nEnglish and Dhivehi are kept separately so one language cannot hide the other. Use Next/Previous to browse all stored Maldives stories.",
+        main_keyboard(),
+        start_payload="view_maldives_all",
+    )
+    if not intro:
+        return
+    destination, _, _ = private_destination(message)
+    for language in ("en", "dv"):
+        rows, total = query_stories("maldives", 0, language)
+        text, markup = format_story_page(title_for_kind("maldives", language), "maldives", rows, total, 0, language)
+        send_message(text, destination, markup)
+
+
+def search_stories(query, page=0):
+    terms = [term.lower() for term in clean_text(query).split() if term]
+    if not terms:
+        return [], 0
+    cutoff = (utc_now() - timedelta(days=ARCHIVE_RETENTION_DAYS)).isoformat()
+    with DB_LOCK, db_connect() as db:
+        rows = db.execute(
+            "SELECT * FROM stories WHERE last_seen>=? ORDER BY last_seen DESC LIMIT 1000", (cutoff,)
+        ).fetchall()
+    matches = []
+    for row in rows:
+        searchable = " ".join([row["representative_title"], row["category"], row["primary_publisher"], row["story_location"]]).lower()
+        if all(term in searchable for term in terms):
+            matches.append(row)
+    total = len(matches)
+    start = page * PRIVATE_PAGE_SIZE
+    return matches[start : start + PRIVATE_PAGE_SIZE], total
+
+
+def health_text():
+    with DB_LOCK, db_connect() as db:
+        rows = db.execute("SELECT * FROM source_health ORDER BY consecutive_failures DESC, source_name").fetchall()
+    healthy = sum(1 for row in rows if row["consecutive_failures"] == 0)
+    lines = [f"📡 <b>Source Health</b>\n\nHealthy: <b>{healthy}/{len(rows)}</b>\n"]
+    for row in rows[:20]:
+        icon = "✅" if row["consecutive_failures"] == 0 else "⚠️"
+        lines.append(f"{icon} {html.escape(row['source_name'])} · {row['article_count']} items · {row['response_ms']} ms")
+    return "\n".join(lines)[:3900]
+
+
+def sources_text():
+    lines = [f"🗞️ <b>Maldives News Sources</b>\n\nMonitoring <b>{len(MALDIVES_DOMAINS)}</b> Maldivian publisher domains in both English and Dhivehi discovery feeds, plus direct RSS where available.\n"]
+    for index, domain in enumerate(MALDIVES_DOMAINS, start=1):
+        lines.append(f"{index}. {domain}")
+    return "\n".join(lines)[:3900]
+
+
+def welcome_text():
+    return (
+        f"📰 <b>{BOT_NAME}</b>\n\n"
+        "🇲🇻 Maldives — English + Dhivehi archive\n"
+        "🌍 Global — worldwide news\n"
+        "🚨 Important — high-priority and breaking developments\n"
+        "🧭 News Topics — politics, business, technology/AI, sports, entertainment, health, science, travel, crime/courts and environment\n\n"
+        "Automatic selected news stays in the group. Interactive results are private."
     )
 
 
-def recent_history(hours=48):
-    cutoff = utc_now() - timedelta(hours=hours)
-    results = []
+BUTTON_KIND = {
+    "🌍 Global": "global", "🚨 Important": "important", "🚨 Breaking": "breaking", "🏛️ Politics": "politics",
+    "💰 Business": "business", "💻 Technology & AI": "technology", "⚽ Sports": "sports", "🎬 Entertainment": "entertainment",
+    "🏥 Health": "health", "🔬 Science": "science", "✈️ Travel & Tourism": "travel", "🌊 Environment": "environment",
+    "⚖️ Crime & Courts": "crime", "📰 Latest": "latest",
+}
+COMMAND_KIND = {
+    "/global": "global", "/world": "global", "/important": "important", "/trending": "important", "/breaking": "breaking",
+    "/politics": "politics", "/business": "business", "/technology": "technology", "/tech": "technology", "/sports": "sports",
+    "/entertainment": "entertainment", "/health": "health", "/science": "science", "/travel": "travel", "/environment": "environment",
+    "/crime": "crime", "/latest": "latest",
+}
 
-    for item in state.get("history", []):
-        try:
-            if datetime.fromisoformat(item["created_at"]) >= cutoff:
-                results.append(item)
-        except Exception:
-            continue
 
-    return results
-
-
-# ============================================================
-# MAIN NEWS CHECK
-# ============================================================
-
-async def check_and_publish_news():
-    logging.info("Collecting climate and environment news...")
-
-    articles = await asyncio.to_thread(fetch_new_articles)
-    if not articles:
-        state["last_news_check"] = utc_now_iso()
-        save_state()
-        logging.info("No new relevant stories.")
+def handle_message(message):
+    text = str(message.get("text", "") or "").strip()
+    if not text:
+        return
+    parts = text.split(maxsplit=1)
+    command = parts[0].split("@")[0].lower() if text.startswith("/") else ""
+    argument = parts[1].strip() if len(parts) > 1 else ""
+    if command == "/start":
+        send_private(message, welcome_text(), main_keyboard())
+        if argument.startswith("view_"):
+            payload = argument[5:]
+            bits = payload.rsplit("_", 1)
+            kind = bits[0]
+            language = bits[1] if len(bits) == 2 and bits[1] in {"en", "dv"} else None
+            if kind == "maldives" and not language:
+                send_maldives_bilingual(message)
+            elif kind in {"maldives", "global", "important", "breaking", "politics", "business", "technology", "sports", "entertainment", "health", "science", "travel", "environment", "crime", "latest"}:
+                send_kind_page(message, kind, 0, language)
+        return
+    if command in {"/help", "/menu"} or text == "⬅️ Main Menu":
+        send_private(message, welcome_text(), main_keyboard())
+        return
+    if text in {"🧭 News Topics", "🧭 Related Topics"} or command == "/topics":
+        send_private(message, "🧭 <b>News Topics</b>\n\nChoose a topic below. Results are sent privately.", topics_keyboard(), "topics")
+        return
+    if text == "🇲🇻 Maldives" or command == "/maldives":
+        send_maldives_bilingual(message)
+        return
+    kind = BUTTON_KIND.get(text) or COMMAND_KIND.get(command)
+    if kind:
+        send_kind_page(message, kind)
+        return
+    if command == "/sources":
+        send_private(message, sources_text(), main_keyboard(), "sources")
+        return
+    if command == "/health":
+        sender = str((message.get("from") or {}).get("id") or "")
+        if ADMIN_USER_IDS and sender not in ADMIN_USER_IDS:
+            send_private(message, "🔒 This command is restricted to bot administrators.", main_keyboard())
+        else:
+            send_private(message, health_text(), main_keyboard())
+        return
+    if command == "/search":
+        if not argument:
+            send_private(message, "🔎 <b>Search news</b>\n\nExample: <code>/search Maldives tourism</code>", main_keyboard())
+            return
+        rows, total = search_stories(argument, 0)
+        text_out, markup = format_story_page(f"Search: {argument}", "latest", rows, total, 0)
+        send_private(message, text_out, markup or main_keyboard())
         return
 
-    clusters = cluster_articles(articles)
-    ranked = []
 
-    for cluster in clusters:
-        highest_score = max(calculate_importance(article) for article in cluster["articles"])
-        highest_score += min((len(cluster["publishers"]) - 1) * 6, 18)
-        ranked.append({"cluster": cluster, "local_score": min(100, highest_score)})
+def handle_callback(callback):
+    callback_id = callback.get("id")
+    data = str(callback.get("data") or "")
+    message = callback.get("message") or {}
+    sender = callback.get("from") or {}
+    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id})
+    if not data.startswith("page|"):
+        return
+    bits = data.split("|")
+    if len(bits) != 4:
+        return
+    _, kind, lang_code, page_text = bits
+    try:
+        page = max(0, int(page_text))
+    except ValueError:
+        page = 0
+    language = lang_code if lang_code in {"en", "dv"} else None
+    rows, total = query_stories(kind, page, language)
+    text, markup = format_story_page(title_for_kind(kind, language), kind, rows, total, page, language)
+    chat_id = (message.get("chat") or {}).get("id")
+    message_id = message.get("message_id")
+    if chat_id and message_id and str(chat_id) == str(sender.get("id")):
+        edit_message(chat_id, message_id, text, markup)
 
-    ranked.sort(
-        key=lambda item: (
-            0 if is_maldives_story(item["cluster"]["articles"][0]) else 1,
-            0 if is_breaking_story(item["cluster"]["articles"][0]) else 1,
-            -item["local_score"],
-            -len(item["cluster"]["publishers"]),
-        )
+
+def group_post_message(row):
+    summary = story_summary(row["id"])
+    emoji = CATEGORY_EMOJIS.get(row["category"], "📰")
+    header = "🚨 <b>BREAKING NEWS</b>\n\n" if row["breaking"] else ("🔥 <b>IMPORTANT NEWS</b>\n\n" if row["importance"] >= 82 else "")
+    lang = "Dhivehi" if row["language"] == "dv" else "English"
+    region = "🇲🇻 Maldives" if row["maldives"] else "🌍 Global"
+    publishers = html.escape(", ".join(publishers_for_story(row)[:4]))
+    return (
+        f"{header}{emoji} <b>{html.escape(row['category'])}</b> · {region} · {lang}\n\n"
+        f"📰 <b>{html.escape(row['representative_title'])}</b>\n\n"
+        f"• {html.escape(summary[0])}\n"
+        f"• {html.escape(summary[1])}\n\n"
+        f"📊 <b>Priority:</b> {row['importance']}/100\n"
+        f"🏢 <b>Sources:</b> {publishers}\n\n"
+        f'<a href="{html.escape(row["primary_url"], quote=True)}">🔗 Open original report</a>'
     )
 
-    posted_count = 0
-    ai_used_this_check = 0
 
-    for item in ranked:
-        if posted_count >= MAX_POSTS_PER_CHECK:
-            break
-
-        cluster = item["cluster"]
-        local_score = item["local_score"]
-        first_article = cluster["articles"][0]
-
-        if not is_environment_story(first_article) or local_score < MINIMUM_POST_SCORE:
+def select_group_candidates(changed_ids):
+    rows = story_rows_by_ids(changed_ids)
+    eligible = [
+        row for row in rows
+        if not row["low_value"] and row["importance"] >= MINIMUM_POST_SCORE
+        and (
+            not row["published_to_group"]
+            or row["breaking"] > row["published_breaking"]
+            or row["importance"] >= row["published_importance"] + 15
+        )
+    ]
+    buckets = {"mv_en": [], "mv_dv": [], "global": []}
+    for row in eligible:
+        if row["maldives"]:
+            buckets["mv_dv" if row["language"] == "dv" else "mv_en"].append(row)
+        else:
+            buckets["global"].append(row)
+    for bucket in buckets.values():
+        bucket.sort(key=lambda row: (row["breaking"], row["importance"], row["last_seen"]), reverse=True)
+    ordered = []
+    while any(buckets.values()):
+        for name in ("mv_en", "mv_dv", "global"):
+            if buckets[name]:
+                ordered.append(buckets[name].pop(0))
+    selected = []
+    category_counts = {}
+    for row in ordered:
+        key = ("mv" if row["maldives"] else "global", row["category"])
+        if category_counts.get(key, 0) >= 2 and not row["breaking"]:
             continue
+        selected.append(row)
+        category_counts[key] = category_counts.get(key, 0) + 1
+        if len(selected) >= MAX_POSTS_PER_CHECK:
+            break
+    return selected
 
-        analysis = None
 
-        if should_use_ai(cluster, local_score, ai_used_this_check):
-            analysis = await asyncio.to_thread(analyze_cluster_with_ai, cluster)
-            if analysis:
-                ai_used_this_check += 1
-
-        if not analysis:
-            analysis = local_cluster_analysis(cluster, local_score)
-
-        trend_score = calculate_trending_score(cluster, analysis)
-        message = build_news_message(cluster, analysis, trend_score)
-        buttons = build_source_buttons(cluster)
-
-        published = await asyncio.to_thread(
-            publish_post,
-            message,
-            cluster.get("image"),
-            buttons,
+def mark_group_published(row):
+    with DB_LOCK, db_connect() as db:
+        db.execute(
+            "UPDATE stories SET published_to_group=1,published_importance=?,published_breaking=? WHERE id=?",
+            (row["importance"], row["breaking"], row["id"]),
         )
+        db.commit()
 
-        if published:
-            save_to_history(cluster, analysis, trend_score)
-            posted_count += 1
+
+async def check_and_publish_news():
+    logging.info("Starting unified all-news collection...")
+    articles = await asyncio.to_thread(fetch_all_articles)
+    changed_ids = await asyncio.to_thread(archive_articles, articles)
+    set_setting("last_news_check", utc_now_iso())
+    candidates = select_group_candidates(changed_ids)
+    posted = 0
+    for row in candidates:
+        message = group_post_message(row)
+        result = await asyncio.to_thread(send_message, message, GROUP_CHAT_ID, None, False)
+        if result:
+            mark_group_published(row)
+            posted += 1
             await asyncio.sleep(MESSAGE_DELAY_SECONDS)
-
-    state["last_news_check"] = utc_now_iso()
-    save_state()
-    logging.info("Completed: %s posts, %s AI requests.", posted_count, ai_used_this_check)
+    cleanup_db()
+    logging.info("News cycle complete: %s group posts; %s changed stories archived", posted, len(changed_ids))
 
 
-# ============================================================
-# DIGESTS AND COMMANDS
-# ============================================================
-
-def build_digest(title, hours):
-    stories = recent_history(hours)
-
-    if not stories:
-        return (
-            f"🌿 <b>{html.escape(title)}</b>\n\n"
-            "No new climate or environmental stories were published in this period."
-        )
-
-    stories.sort(
-        key=lambda story: (
-            0 if story.get("maldives") else 1,
-            0 if story.get("breaking") else 1,
-            -story.get("trending_score", 0),
-        )
-    )
-
-    message = (
-        f"🌿 <b>{html.escape(title)}</b>\n\n"
-        f"From <b>{BOT_NAME}</b>\n\n"
-    )
-
-    for index, story in enumerate(stories[:12], start=1):
-        category = story.get("category", "Environment")
-        emoji = CATEGORY_EMOJIS.get(category, "🌍")
-        headline = html.escape(story.get("headline", "Untitled report"))
-        link = html.escape(story.get("link", ""), quote=True)
-        region = "🇲🇻" if story.get("maldives") else "🌍"
-
-        message += (
-            f'{index}. {region} {emoji} <a href="{link}">{headline}</a>\n'
-            f"   📊 {story.get('trending_score', 0)}/100\n\n"
-        )
-
-    return shorten_text(message, 3900)
+def digest_message(title, hours):
+    cutoff = (utc_now() - timedelta(hours=hours)).isoformat()
+    with DB_LOCK, db_connect() as db:
+        rows = db.execute(
+            "SELECT * FROM stories WHERE last_seen>=? ORDER BY breaking DESC,importance DESC,last_seen DESC LIMIT 12",
+            (cutoff,),
+        ).fetchall()
+    if not rows:
+        return f"📰 <b>{html.escape(title)}</b>\n\nNo new stories were archived in this period."
+    message = f"📰 <b>{html.escape(title)}</b>\n\n"
+    for index, row in enumerate(rows, start=1):
+        region = "🇲🇻" if row["maldives"] else "🌍"
+        emoji = CATEGORY_EMOJIS.get(row["category"], "📰")
+        line = f'{index}. {region} {emoji} <a href="{html.escape(row["primary_url"], quote=True)}">{html.escape(row["representative_title"])}</a>\n'
+        if len(message) + len(line) > 3800:
+            break
+        message += line
+    return message
 
 
 async def digest_scheduler():
     while True:
         now = maldives_now()
         today = now.date().isoformat()
-
-        if (
-            now.hour == MORNING_DIGEST_HOUR
-            and now.minute < 5
-            and state.get("last_morning_digest") != today
-        ):
-            await asyncio.to_thread(
-                send_message,
-                build_digest("Morning Climate & Environment Brief", 12),
-            )
-            state["last_morning_digest"] = today
-            save_state()
-
-        if (
-            now.hour == EVENING_DIGEST_HOUR
-            and now.minute < 5
-            and state.get("last_evening_digest") != today
-        ):
-            await asyncio.to_thread(
-                send_message,
-                build_digest("Evening Climate & Environment Brief", 12),
-            )
-            state["last_evening_digest"] = today
-            save_state()
-
+        if now.hour == MORNING_DIGEST_HOUR and now.minute < 5 and get_setting("last_morning_digest") != today:
+            await asyncio.to_thread(send_message, digest_message("Morning News Brief", 12), GROUP_CHAT_ID)
+            set_setting("last_morning_digest", today)
+        if now.hour == EVENING_DIGEST_HOUR and now.minute < 5 and get_setting("last_evening_digest") != today:
+            await asyncio.to_thread(send_message, digest_message("Evening News Brief", 12), GROUP_CHAT_ID)
+            set_setting("last_evening_digest", today)
         await asyncio.sleep(60)
 
 
-HELP_TEXT = f"""
-🌿 <b>Welcome to {BOT_NAME}</b>
-
-This bot publishes only climate and environmental news from the Maldives and around the world.
-
-Covered topics:
-🇲🇻 Maldives environment and climate
-🌡️ Climate change and extreme weather
-🌊 Oceans, coral reefs and marine ecosystems
-🦋 Biodiversity and wildlife
-♻️ Pollution, plastics and waste
-🌱 Conservation and ecosystem restoration
-🌳 Forests and mangroves
-⚡ Renewable and clean energy
-🏛️ Climate policy and finance
-🔬 Environmental science and research
-
-General politics, sports, entertainment, technology and business stories are excluded unless they are directly about climate or the environment.
-
-Search recent stories with:
-<code>/search coral bleaching</code>
-""".strip()
-
-
-def filter_history(category_names=None, maldives_only=False, global_only=False, query=None, limit=8):
-    stories = list(reversed(state.get("history", [])))
-    results = []
-    accepted = {name.lower() for name in category_names} if category_names else set()
-
-    for story in stories:
-        if maldives_only and not story.get("maldives"):
-            continue
-        if global_only and story.get("maldives"):
-            continue
-        if accepted and story.get("category", "").lower() not in accepted:
-            continue
-
-        if query:
-            searchable = " ".join(
-                [
-                    story.get("headline", ""),
-                    " ".join(story.get("summary", [])),
-                    " ".join(story.get("publishers", [])),
-                    story.get("category", ""),
-                ]
-            ).lower()
-            terms = [term for term in query.lower().split() if term]
-            if not all(term in searchable for term in terms):
-                continue
-
-        results.append(story)
-        if len(results) >= limit:
-            break
-
-    return results
-
-
-def build_story_list(title, stories):
-    if not stories:
-        return (
-            f"🌿 <b>{html.escape(title)}</b>\n\n"
-            "No matching climate or environmental stories are available yet."
-        )
-
-    message = f"🌿 <b>{html.escape(title)}</b>\n\n"
-
-    for index, story in enumerate(stories, start=1):
-        category = story.get("category", "Environment")
-        emoji = CATEGORY_EMOJIS.get(category, "🌍")
-        headline = html.escape(story.get("headline", "Untitled report"))
-        link = html.escape(story.get("link", ""), quote=True)
-        region = "🇲🇻" if story.get("maldives") else "🌍"
-
-        message += (
-            f'{index}. {region} {emoji} <a href="{link}">{headline}</a>\n'
-            f"   📊 Trending: {story.get('trending_score', 0)}/100\n\n"
-        )
-
-    return shorten_text(message, 3900)
-
-
-def handle_command(message):
-    text = message.get("text", "").strip()
-    chat_id = message.get("chat", {}).get("id")
-
-    button_commands = {
-        "📰 Latest": "/latest",
-        "🔥 Trending": "/trending",
-        "🇲🇻 Maldives": "/maldives",
-        "🌍 Global": "/global",
-        "🌡️ Climate": "/climate",
-        "🌊 Oceans & Reefs": "/oceans",
-        "🦋 Wildlife": "/wildlife",
-        "♻️ Pollution & Waste": "/pollution",
-        "🌱 Conservation": "/conservation",
-        "⚡ Clean Energy": "/energy",
-        "❓ Help": "/help",
-    }
-
-    text = button_commands.get(text, text)
-    if not text.startswith("/"):
-        return
-
-    parts = text.split(maxsplit=1)
-    command = parts[0].split("@")[0].lower()
-    argument = parts[1].strip() if len(parts) > 1 else ""
-
-    if command in {"/start", "/help"}:
-        send_message(HELP_TEXT, chat_id, reply_markup=public_command_keyboard())
-    elif command == "/latest":
-        send_message(build_story_list("Latest Climate & Environment News", filter_history(limit=8)), chat_id)
-    elif command == "/trending":
-        stories = recent_history(48)
-        stories.sort(key=lambda story: story.get("trending_score", 0), reverse=True)
-        send_message(build_story_list("Trending Climate & Environment Stories", stories[:8]), chat_id)
-    elif command == "/maldives":
-        send_message(build_story_list("Maldives Climate & Environment", filter_history(maldives_only=True, limit=8)), chat_id)
-    elif command in {"/global", "/world"}:
-        send_message(build_story_list("Global Climate & Environment", filter_history(global_only=True, limit=8)), chat_id)
-    elif command == "/climate":
-        send_message(
-            build_story_list(
-                "Climate Change & Extreme Weather",
-                filter_history(category_names={"Climate Change", "Extreme Weather", "Climate Policy & Finance"}, limit=8),
-            ),
-            chat_id,
-        )
-    elif command == "/oceans":
-        send_message(build_story_list("Oceans & Reefs", filter_history(category_names={"Oceans & Reefs"}, limit=8)), chat_id)
-    elif command == "/wildlife":
-        send_message(build_story_list("Biodiversity & Wildlife", filter_history(category_names={"Biodiversity & Wildlife"}, limit=8)), chat_id)
-    elif command == "/pollution":
-        send_message(build_story_list("Pollution & Waste", filter_history(category_names={"Pollution & Waste"}, limit=8)), chat_id)
-    elif command == "/conservation":
-        send_message(
-            build_story_list(
-                "Conservation & Restoration",
-                filter_history(category_names={"Conservation & Restoration", "Forests & Mangroves"}, limit=8),
-            ),
-            chat_id,
-        )
-    elif command == "/energy":
-        send_message(build_story_list("Clean Energy", filter_history(category_names={"Clean Energy"}, limit=8)), chat_id)
-    elif command == "/search":
-        if not argument:
-            send_message(
-                "🔎 <b>Search climate & environment news</b>\n\n"
-                "Example:\n<code>/search coral bleaching</code>",
-                chat_id,
-            )
-        else:
-            send_message(build_story_list(f"Search results: {argument}", filter_history(query=argument, limit=10)), chat_id)
-    else:
-        send_message(
-            "Use /help to view the climate and environment menu.",
-            chat_id,
-            reply_markup=public_command_keyboard(),
-        )
-
-
-# ============================================================
-# TELEGRAM LONG POLLING AND STARTUP
-# ============================================================
-
 def get_updates():
+    try:
+        offset = int(get_setting("telegram_offset", "0") or 0)
+    except ValueError:
+        offset = 0
     return telegram_api(
         "getUpdates",
-        {
-            "offset": state.get("telegram_offset", 0),
-            "timeout": 25,
-            "allowed_updates": ["message"],
-        },
+        {"offset": offset, "timeout": 25, "allowed_updates": ["message", "callback_query"]},
         timeout=35,
     )
 
@@ -1513,22 +1228,18 @@ def get_updates():
 async def command_listener():
     while True:
         updates = await asyncio.to_thread(get_updates)
-
         if not updates:
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
             continue
-
         for update in updates:
-            state["telegram_offset"] = update.get("update_id", 0) + 1
-            message = update.get("message")
-
-            if message:
-                try:
-                    await asyncio.to_thread(handle_command, message)
-                except Exception as error:
-                    logging.exception("Command error: %s", error)
-
-            save_state()
+            set_setting("telegram_offset", update.get("update_id", 0) + 1)
+            try:
+                if update.get("message"):
+                    await asyncio.to_thread(handle_message, update["message"])
+                elif update.get("callback_query"):
+                    await asyncio.to_thread(handle_callback, update["callback_query"])
+            except Exception as error:
+                logging.exception("Telegram interaction failed: %s", error)
 
 
 async def automatic_news_loop():
@@ -1537,91 +1248,61 @@ async def automatic_news_loop():
             await check_and_publish_news()
         except Exception as error:
             logging.exception("News check failed: %s", error)
-
-        logging.info(
-            "Waiting %.1f minutes before the next check.",
-            NEWS_CHECK_INTERVAL_SECONDS / 60,
-        )
         await asyncio.sleep(NEWS_CHECK_INTERVAL_SECONDS)
+
+
+PUBLIC_COMMANDS = [
+    {"command": "maldives", "description": "Maldives news in English + Dhivehi"},
+    {"command": "global", "description": "Global news"},
+    {"command": "important", "description": "Important and breaking news"},
+    {"command": "topics", "description": "Browse all news topics"},
+    {"command": "latest", "description": "Latest news"},
+    {"command": "politics", "description": "Politics"},
+    {"command": "business", "description": "Business and economy"},
+    {"command": "technology", "description": "Technology and AI"},
+    {"command": "sports", "description": "Sports"},
+    {"command": "entertainment", "description": "Entertainment"},
+    {"command": "health", "description": "Health"},
+    {"command": "science", "description": "Science"},
+    {"command": "travel", "description": "Travel and tourism"},
+    {"command": "environment", "description": "Environment and climate"},
+    {"command": "crime", "description": "Crime and courts"},
+    {"command": "search", "description": "Search archived news"},
+    {"command": "sources", "description": "Show Maldives news outlets monitored"},
+]
 
 
 def validate_configuration():
     missing = []
-
     if not TELEGRAM_BOT_TOKEN:
         missing.append("TELEGRAM_BOT_TOKEN")
     if not GROUP_CHAT_ID:
         missing.append("GROUP_CHAT_ID")
-
     if missing:
-        raise ValueError(
-            "Missing required environment variable(s): " + ", ".join(missing)
-        )
-
-    if not GEMINI_API_KEY:
-        logging.warning("GEMINI_API_KEY is not set; local summaries will be used.")
-
-
-def test_telegram_connection():
-    bot_information = telegram_api("getMe")
-    if not bot_information:
-        return False
-
-    logging.info(
-        "Connected to Telegram as @%s",
-        bot_information.get("username", "unknown_bot"),
-    )
-    return True
-
-
-def build_welcome_message():
-    return f"""
-🌿 <b>{BOT_NAME}</b>
-
-The bot is now focused only on climate and environmental news.
-
-🇲🇻 Maldives climate & environment
-🌍 Global climate & environment
-🌊 Coral reefs, oceans and marine ecosystems
-🦋 Biodiversity and wildlife
-♻️ Pollution, plastics and waste
-🌱 Conservation and restoration
-🌳 Forests and mangroves
-⚡ Clean energy
-🚨 Major environmental hazards
-
-General news is filtered out unless it directly relates to climate or the environment.
-""".strip()
+        raise ValueError("Missing required environment variable(s): " + ", ".join(missing))
 
 
 async def main():
     validate_configuration()
-    logging.info("Starting %s...", BOT_NAME)
+    init_db()
+    info = await asyncio.to_thread(telegram_api, "getMe")
+    if not info:
+        raise RuntimeError("Telegram connection failed")
+    global BOT_USERNAME
+    BOT_USERNAME = str(info.get("username") or "").strip().lstrip("@")
+    await asyncio.to_thread(telegram_api, "setMyCommands", {"commands": PUBLIC_COMMANDS})
+    if get_setting("startup_announcement_version") != APP_VERSION:
+        await asyncio.to_thread(send_message, welcome_text(), GROUP_CHAT_ID, main_keyboard(), True)
+        set_setting("startup_announcement_version", APP_VERSION)
+    await asyncio.gather(automatic_news_loop(), command_listener(), digest_scheduler())
 
-    if not await asyncio.to_thread(test_telegram_connection):
-        logging.error("Telegram connection failed.")
-        return
 
-    await asyncio.to_thread(register_public_commands)
-    await asyncio.to_thread(
-        send_message,
-        build_welcome_message(),
-        GROUP_CHAT_ID,
-        False,
-        public_command_keyboard(),
-    )
-
-    await asyncio.gather(
-        automatic_news_loop(),
-        command_listener(),
-        digest_scheduler(),
-    )
-
+init_db()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("%s stopped.", BOT_NAME)
+        logging.info("%s stopped", BOT_NAME)
     except Exception as error:
         logging.exception("The bot could not start: %s", error)
