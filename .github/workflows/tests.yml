@@ -14,5 +14,17 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - run: python -m py_compile main.py private_group_ui.py
-      - run: python -m unittest -v test_news_platform.py test_private_group_ui.py
+      - run: >-
+          python -m py_compile
+          main.py
+          private_group_ui.py
+          continuous_private_ui.py
+          private_image_ui.py
+          bilingual_onboarding.py
+          private_start_prompt.py
+          professional_private_ui.py
+      - run: >-
+          python -m unittest -v
+          test_news_platform.py
+          test_private_group_ui.py
+          test_private_features.py
