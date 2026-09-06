@@ -1,7 +1,7 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "deploy": {
-    "startCommand": "sh -c 'sleep 25; exec python -u private_start_prompt.py 2>&1'",
+    "startCommand": "sh -c 'sleep 25; exec python -u professional_private_ui.py 2>&1'",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }
