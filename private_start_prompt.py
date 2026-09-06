@@ -1,17 +1,16 @@
-"""Final Telegram launcher: private image news plus first-time Start prompt.
+"""Final Telegram launcher: bilingual onboarding, private image news and Start prompt.
 
 Telegram bots cannot initiate a private chat with a user who has never opened the bot
 and pressed Start. The image-card UI keeps news results out of the group, so this
-wrapper restores only the onboarding prompt: if a private delivery fails for a group
-user, the group receives a temporary inline button that opens the bot with the
-original request encoded in the deep link. No news content is posted publicly.
+wrapper shows only a temporary onboarding prompt when a private delivery is blocked.
+No news content is posted publicly.
 """
 
 import asyncio
 import logging
 import threading
 
-import private_image_ui as app
+import bilingual_onboarding as app
 
 bot = app.bot
 ui = app.ui
@@ -65,15 +64,17 @@ def send_private_with_start_prompt(message, text, reply_markup=None, start_paylo
     markup = {
         "inline_keyboard": [[
             {
-                "text": "📩 Open Private News & Start",
+                "text": "🔴 START PRIVATE NEWS 🔴",
                 "url": f"https://t.me/{username}?start={payload}",
             }
         ]]
     }
     prompt = ui._base_send_message(
-        "📩 <b>Private news setup</b>\n\n"
-        "Telegram requires you to open the bot and press <b>Start</b> once before I can send you private news. "
-        "Tap below, press Start, and your request will continue privately.",
+        "🚨 <b>PRIVATE NEWS SETUP REQUIRED</b> 🚨\n\n"
+        "🇬🇧 Telegram requires you to open the bot and press <b>Start</b> once before private news can be delivered. "
+        "Tap the red button below, then press <b>Start</b>.\n\n"
+        "🇲🇻 ޕްރައިވެޓް ނޫސް ލިބޭން ފުރަތަމަ ފަހަރަށް ބޮޓް ހުޅުވާ <b>Start</b> ފިތަންޖެހޭނެ. "
+        "ތިރީގައި ހުންނަ ރަތް ބަޓަން ފިތާ، ބޮޓުގެ ޗެޓުގައި <b>Start</b> ފިތާލާ.",
         origin_chat_id,
         markup,
         True,
@@ -84,8 +85,8 @@ def send_private_with_start_prompt(message, text, reply_markup=None, start_paylo
     return prompt
 
 
-# The image-card UI and group UI both resolve bot.send_private dynamically, so this
-# final patch covers group buttons, topic buttons, image-card batches and searches.
+# The bilingual onboarding and image-card UI resolve bot.send_private dynamically, so
+# this final patch covers group buttons, topic buttons, image-card batches and searches.
 bot.send_private = send_private_with_start_prompt
 
 
