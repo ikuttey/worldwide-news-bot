@@ -1,27 +1,194 @@
 """Private Telegram news browsing without user-facing pagination.
 
 This presentation layer keeps the existing solid group keyboard and disappearing
-button messages from private_group_ui.py. It changes only private browsing: every
-matching story is sent automatically as one continuous result stream. Telegram's
-message-size limit may require several consecutive messages, but users never need to
-press Next or Previous.
+button messages from private_group_ui.py. Private browsing sends every matching story
+automatically without Next/Previous controls.
+
+Automatic group posts also try to use each publisher article's own preview image.
+The image is read from standard article metadata such as og:image or twitter:image.
+If the publisher does not expose a usable image, Telegram falls back to the existing
+text-only group post so news delivery is never blocked by image extraction.
 """
 
 import asyncio
 import html
 import logging
 import time
+from html.parser import HTMLParser
+from urllib.parse import urljoin, urlsplit
 
 import main as bot
 import private_group_ui as ui
 
 STREAM_MESSAGE_LIMIT = 3650
 STREAM_DELAY_SECONDS = 0.8
+ARTICLE_IMAGE_HTML_LIMIT = 750000
 
 _base_query_stories = bot.query_stories
 _base_search_stories = bot.search_stories
 _base_handle_message = bot.handle_message
 _base_handle_callback = bot.handle_callback
+
+
+class ArticleImageParser(HTMLParser):
+    """Extract the publisher's preferred article image from HTML metadata."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.candidates = []
+
+    def handle_starttag(self, tag, attrs):
+        values = {str(key).lower(): value for key, value in attrs if key and value}
+        if tag.lower() == "meta":
+            key = str(values.get("property") or values.get("name") or "").lower().strip()
+            if key in {
+                "og:image",
+                "og:image:url",
+                "og:image:secure_url",
+                "twitter:image",
+                "twitter:image:src",
+            }:
+                content = str(values.get("content") or "").strip()
+                if content:
+                    self.candidates.append(content)
+        elif tag.lower() == "link":
+            rel = str(values.get("rel") or "").lower()
+            href = str(values.get("href") or "").strip()
+            if href and "image_src" in rel:
+                self.candidates.append(href)
+
+
+def usable_image_url(url):
+    url = str(url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return False
+    try:
+        host = urlsplit(url).netloc.lower().removeprefix("www.")
+    except Exception:
+        return False
+    if not host:
+        return False
+    # Avoid generic Google News branding being mistaken for the publisher's article image.
+    blocked = {"news.google.com", "google.com", "www.google.com", "gstatic.com"}
+    return not any(host == item or host.endswith("." + item) for item in blocked)
+
+
+def resolve_article_image(article_url):
+    """Return an article preview image URL, or None when the outlet exposes none."""
+    article_url = str(article_url or "").strip()
+    if not article_url.startswith(("http://", "https://")):
+        return None
+    try:
+        response = bot.requests.get(
+            article_url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
+                    "Chrome/126.0 Mobile Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml",
+            },
+            timeout=(5, 12),
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+        content_type = str(response.headers.get("content-type") or "").lower()
+        if "html" not in content_type and not response.text.lstrip().startswith("<"):
+            return None
+        parser = ArticleImageParser()
+        parser.feed(response.text[:ARTICLE_IMAGE_HTML_LIMIT])
+        base_url = response.url or article_url
+        for candidate in parser.candidates:
+            resolved = urljoin(base_url, html.unescape(candidate).strip())
+            if usable_image_url(resolved):
+                return resolved
+    except Exception as error:
+        logging.debug("Article image lookup failed for %s: %s", article_url, error)
+    return None
+
+
+def group_photo_caption(row):
+    """Build a compact Telegram photo caption while keeping source attribution."""
+    summary = bot.story_summary(row["id"])
+    emoji = bot.CATEGORY_EMOJIS.get(row["category"], "📰")
+    header = "🚨 <b>BREAKING NEWS</b>\n\n" if row["breaking"] else (
+        "🔥 <b>IMPORTANT NEWS</b>\n\n" if row["importance"] >= 82 else ""
+    )
+    region = "🇲🇻 Maldives" if row["maldives"] else "🌍 Global"
+    lang = "Dhivehi" if row["language"] == "dv" else "English"
+    title = html.escape(bot.shorten_text(row["representative_title"], 250))
+    publisher = html.escape(bot.shorten_text(row["primary_publisher"], 90))
+    summary_text = html.escape(bot.shorten_text(summary[0] if summary else "", 260))
+    url = html.escape(row["primary_url"], quote=True)
+    caption = (
+        f"{header}{emoji} <b>{html.escape(row['category'])}</b> · {region} · {lang}\n\n"
+        f"📰 <b>{title}</b>\n\n"
+        f"{summary_text}\n\n"
+        f"🏢 <b>Source:</b> {publisher}\n"
+        f"📊 <b>Priority:</b> {row['importance']}/100\n\n"
+        f'<a href="{url}">🔗 Open original report</a>'
+    )
+    # Telegram photo captions are shorter than normal text messages.
+    return caption[:1000]
+
+
+def clear_keyboard_keeper_after_photo(result):
+    """Remove the short startup keyboard message after the first successful photo post."""
+    keeper = getattr(ui, "_keyboard_keeper_message_id", None)
+    if not keeper or not result:
+        return
+    new_message_id = result.get("message_id") if isinstance(result, dict) else None
+    if new_message_id == keeper:
+        return
+    bot.telegram_api(
+        "deleteMessage",
+        {"chat_id": str(bot.GROUP_CHAT_ID), "message_id": keeper},
+    )
+    ui._keyboard_keeper_message_id = None
+    bot.set_setting("solid_keyboard_keeper_message_id", "")
+
+
+def send_group_story(row):
+    """Send a group story with the publisher image when possible, otherwise text."""
+    image_url = resolve_article_image(row["primary_url"])
+    if image_url:
+        payload = {
+            "chat_id": str(bot.GROUP_CHAT_ID),
+            "photo": image_url,
+            "caption": group_photo_caption(row),
+            "parse_mode": "HTML",
+            "reply_markup": bot.main_keyboard(),
+        }
+        result = bot.telegram_api("sendPhoto", payload, timeout=45)
+        if result:
+            clear_keyboard_keeper_after_photo(result)
+            logging.info("Posted group story with publisher image: %s", row["primary_publisher"])
+            return result
+        logging.info("Publisher image could not be sent; using text fallback for %s", row["primary_publisher"])
+
+    return bot.send_message(bot.group_post_message(row), bot.GROUP_CHAT_ID, None, False)
+
+
+async def check_and_publish_news_with_images():
+    """Run the normal archive pipeline, adding publisher images only at group delivery."""
+    logging.info("Starting unified all-news collection...")
+    articles = await asyncio.to_thread(bot.fetch_all_articles)
+    changed_ids = await asyncio.to_thread(bot.archive_articles, articles)
+    bot.set_setting("last_news_check", bot.utc_now_iso())
+    candidates = bot.select_group_candidates(changed_ids)
+    posted = 0
+    for row in candidates:
+        result = await asyncio.to_thread(send_group_story, row)
+        if result:
+            bot.mark_group_published(row)
+            posted += 1
+            await asyncio.sleep(bot.MESSAGE_DELAY_SECONDS)
+    bot.cleanup_db()
+    logging.info(
+        "News cycle complete: %s group posts; %s changed stories archived",
+        posted,
+        len(changed_ids),
+    )
 
 
 def collect_all_rows(kind, language=None):
@@ -190,7 +357,8 @@ def handle_message(message):
     return _base_handle_message(message)
 
 
-# Global lookups inside main.handle_message resolve these replacements at runtime.
+# Global lookups inside main.py resolve these replacements at runtime.
+bot.check_and_publish_news = check_and_publish_news_with_images
 bot.send_kind_page = send_kind_all
 bot.send_maldives_bilingual = send_maldives_all
 ui.send_maldives_from_callback = send_maldives_all
