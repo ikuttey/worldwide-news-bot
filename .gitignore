@@ -3,5 +3,8 @@
 !.env.example
 __pycache__/
 *.py[cod]
+*.sqlite
+*.sqlite3
+*.db
 climate_environment_news_state.json
 worldwide_news_state.json
