@@ -1,17 +1,17 @@
-"""Final Telegram launcher: private news plus first-time Start prompt.
+"""Final Telegram launcher: private image news plus first-time Start prompt.
 
 Telegram bots cannot initiate a private chat with a user who has never opened the bot
-and pressed Start. The normal UI intentionally keeps news results out of the group, so
-this wrapper restores only the missing onboarding prompt: if a private delivery fails
-for a group user, the group receives a temporary inline button that opens the bot with
-the original request encoded in the deep link. No news content is posted publicly.
+and pressed Start. The image-card UI keeps news results out of the group, so this
+wrapper restores only the onboarding prompt: if a private delivery fails for a group
+user, the group receives a temporary inline button that opens the bot with the
+original request encoded in the deep link. No news content is posted publicly.
 """
 
 import asyncio
 import logging
 import threading
 
-import continuous_private_ui as app
+import private_image_ui as app
 
 bot = app.bot
 ui = app.ui
@@ -84,8 +84,8 @@ def send_private_with_start_prompt(message, text, reply_markup=None, start_paylo
     return prompt
 
 
-# continuous_private_ui and private_group_ui both resolve bot.send_private dynamically,
-# so this final patch covers solid group buttons, topic buttons, searches and old inline controls.
+# The image-card UI and group UI both resolve bot.send_private dynamically, so this
+# final patch covers group buttons, topic buttons, image-card batches and searches.
 bot.send_private = send_private_with_start_prompt
 
 
