@@ -6,6 +6,11 @@ Telegram necessarily creates a normal group message when a reply-keyboard button
 pressed, so the bot immediately deletes that interaction message on a best-effort
 basis and routes the requested result only to the requesting user's private chat.
 
+To keep the solid keyboard reliably visible, every normal bot post sent to the main
+group also carries the same reply keyboard. A small startup activation message keeps
+the keyboard visible before the first news post arrives, then disappears automatically
+as soon as the first normal group post successfully replaces it.
+
 For a completely clean group this requires the bot to have Telegram's Delete Messages
 administrator permission. Slash-command menus remain private-chat only, and manually
 typed group commands are also deleted before their result is routed privately.
@@ -21,10 +26,12 @@ import logging
 
 import main as bot
 
-UI_VERSION = "all-news-v8-solid-private-disappearing"
+UI_VERSION = "all-news-v9-solid-keyboard-kept-alive"
 
 _base_handle_message = bot.handle_message
 _base_handle_callback = bot.handle_callback
+_base_send_message = bot.send_message
+_keyboard_keeper_message_id = None
 
 
 def group_inline_keyboard():
@@ -43,6 +50,38 @@ def group_inline_keyboard():
             {"text": "📩 Open Private News", "url": f"https://t.me/{username}?start=menu"}
         ])
     return {"inline_keyboard": rows}
+
+
+def group_keyboard_send_message(text, chat_id=None, reply_markup=None, disable_preview=True):
+    """Attach the solid keyboard to every normal main-group bot post.
+
+    The short startup activation message remains only until a regular group post has
+    successfully taken over as the message carrying Telegram's persistent keyboard.
+    """
+    global _keyboard_keeper_message_id
+
+    target = str(chat_id or bot.GROUP_CHAT_ID)
+    is_main_group = bool(bot.GROUP_CHAT_ID) and target == str(bot.GROUP_CHAT_ID)
+    injected_keyboard = is_main_group and reply_markup is None
+    if injected_keyboard:
+        reply_markup = bot.main_keyboard()
+
+    result = _base_send_message(text, chat_id, reply_markup, disable_preview)
+
+    if injected_keyboard and result and _keyboard_keeper_message_id:
+        new_message_id = result.get("message_id") if isinstance(result, dict) else None
+        if new_message_id != _keyboard_keeper_message_id:
+            bot.telegram_api(
+                "deleteMessage",
+                {
+                    "chat_id": str(bot.GROUP_CHAT_ID),
+                    "message_id": _keyboard_keeper_message_id,
+                },
+            )
+            _keyboard_keeper_message_id = None
+            bot.set_setting("solid_keyboard_keeper_message_id", "")
+
+    return result
 
 
 def silent_send_private(message, text, reply_markup=None, start_payload="menu"):
@@ -222,7 +261,20 @@ async def remove_old_inline_control_panel():
 
 
 async def restore_solid_group_keyboard():
-    """Show the persistent solid keyboard and delete the small activation message."""
+    """Show the solid keyboard immediately and keep it until a normal news post replaces it."""
+    global _keyboard_keeper_message_id
+
+    old_keeper = bot.get_setting("solid_keyboard_keeper_message_id")
+    if old_keeper:
+        try:
+            await asyncio.to_thread(
+                bot.telegram_api,
+                "deleteMessage",
+                {"chat_id": str(bot.GROUP_CHAT_ID), "message_id": int(old_keeper)},
+            )
+        except (TypeError, ValueError):
+            pass
+
     activation = await asyncio.to_thread(
         bot.send_message,
         "📰 <b>News buttons ready</b>\n\n"
@@ -233,15 +285,9 @@ async def restore_solid_group_keyboard():
         True,
     )
 
-    # The reply keyboard remains on Telegram clients after the activation message is
-    # removed. Keep the group timeline clean by deleting the activation notice.
     if isinstance(activation, dict) and activation.get("message_id"):
-        await asyncio.sleep(2)
-        await asyncio.to_thread(
-            bot.telegram_api,
-            "deleteMessage",
-            {"chat_id": str(bot.GROUP_CHAT_ID), "message_id": activation["message_id"]},
-        )
+        _keyboard_keeper_message_id = activation["message_id"]
+        bot.set_setting("solid_keyboard_keeper_message_id", _keyboard_keeper_message_id)
 
     bot.set_setting("solid_keyboard_version", UI_VERSION)
     return activation
@@ -268,6 +314,9 @@ async def main():
     )
 
 
+# Patch the shared engine at runtime. Private messages stay unchanged; only normal
+# main-group posts receive the solid reply keyboard automatically.
+bot.send_message = group_keyboard_send_message
 bot.send_private = silent_send_private
 bot.handle_callback = handle_callback
 bot.handle_message = handle_message
