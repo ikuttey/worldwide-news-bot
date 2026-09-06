@@ -53,7 +53,7 @@ def send_ephemeral_group_message(user_id, text, reply_markup=None):
         return None
     payload = {
         "chat_id": str(bot.GROUP_CHAT_ID),
-        "receiver_user_id": int(user_id),
+        "ephemeral_message_parameters": {"receiver_user_id": int(user_id)},
         "text": str(text)[:4000],
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
