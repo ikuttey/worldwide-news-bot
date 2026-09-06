@@ -17,10 +17,10 @@ import continuous_private_ui as base
 
 PRIVATE_BATCH_SIZE = 10
 PRIVATE_STORY_DELAY_SECONDS = 0.65
-PRIVATE_CAPTION_LIMIT = 1000
 
 
 def private_story_caption(row):
+    """Build valid HTML for a Telegram photo caption without slicing through tags."""
     summary = bot.story_summary(row["id"])
     emoji = bot.CATEGORY_EMOJIS.get(row["category"], "📰")
     region = "🇲🇻 Maldives" if row["maldives"] else "🌍 Global"
@@ -28,23 +28,34 @@ def private_story_caption(row):
     header = "🚨 <b>BREAKING NEWS</b>\n\n" if row["breaking"] else (
         "🔥 <b>IMPORTANT NEWS</b>\n\n" if row["importance"] >= 82 else ""
     )
-    title = html.escape(bot.shorten_text(row["representative_title"], 240))
-    publisher = html.escape(bot.shorten_text(row["primary_publisher"], 90))
-    summary_text = html.escape(bot.shorten_text(summary[0] if summary else "", 260))
-    url = html.escape(row["primary_url"], quote=True)
-    caption = (
+    title = html.escape(bot.shorten_text(row["representative_title"], 220))
+    publisher = html.escape(bot.shorten_text(row["primary_publisher"], 80))
+    summary_text = html.escape(bot.shorten_text(summary[0] if summary else "", 220))
+    return (
         f"{header}{emoji} <b>{html.escape(row['category'])}</b> · {region} · {lang}\n\n"
         f"📰 <b>{title}</b>\n\n"
         f"{summary_text}\n\n"
         f"🏢 <b>Source:</b> {publisher}\n"
-        f"📊 <b>Priority:</b> {row['importance']}/100\n\n"
-        f'<a href="{url}">🔗 Open original report</a>'
+        f"📊 <b>Priority:</b> {row['importance']}/100"
     )
-    return caption[:PRIVATE_CAPTION_LIMIT]
 
 
 def private_story_text(row):
-    return private_story_caption(row)
+    """Text fallback with a complete, valid HTML link."""
+    caption = private_story_caption(row)
+    url = html.escape(row["primary_url"], quote=True)
+    return f'{caption}\n\n<a href="{url}">🔗 Open original report</a>'
+
+
+def article_link_markup(row):
+    return {
+        "inline_keyboard": [[
+            {
+                "text": "🔗 Open original report",
+                "url": str(row["primary_url"]),
+            }
+        ]]
+    }
 
 
 def send_private_story(destination, row):
@@ -57,6 +68,7 @@ def send_private_story(destination, row):
                 "photo": image_url,
                 "caption": private_story_caption(row),
                 "parse_mode": "HTML",
+                "reply_markup": article_link_markup(row),
             },
             timeout=45,
         )
@@ -222,25 +234,34 @@ def handle_callback(callback):
     callback_id = callback.get("id")
     bits = data.split("|")
     if len(bits) != 4:
+        if callback_id:
+            bot.telegram_api(
+                "answerCallbackQuery",
+                {"callback_query_id": callback_id, "text": "Invalid request."},
+            )
         return None
+
     _, kind, lang_code, offset_text = bits
     try:
         offset = max(0, int(offset_text))
     except ValueError:
         offset = 0
     language = lang_code if lang_code in {"en", "dv"} else None
-    message = callback_message(callback)
-    result = send_batch(message, kind, language, offset, announce=False)
+
+    # Telegram expects callback queries to be acknowledged quickly. Confirm the tap
+    # before fetching images and sending the next batch, which can take several seconds.
     if callback_id:
         bot.telegram_api(
             "answerCallbackQuery",
             {
                 "callback_query_id": callback_id,
-                "text": "More news sent ✅" if result else "Could not send more news.",
-                "show_alert": False if result else True,
+                "text": "Loading more news…",
+                "show_alert": False,
             },
         )
-    return result
+
+    message = callback_message(callback)
+    return send_batch(message, kind, language, offset, announce=False)
 
 
 def handle_message(message):
