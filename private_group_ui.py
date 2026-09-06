@@ -11,6 +11,11 @@ group also carries the same reply keyboard. A small startup activation message k
 the keyboard visible before the first news post arrives, then disappears automatically
 as soon as the first normal group post successfully replaces it.
 
+New members need a fresh reply-keyboard message after they join because Telegram does
+not reliably apply a keyboard that was sent before the member entered the chat. When a
+new member joins, the bot sends a short temporary keyboard activation message. The next
+normal group news post replaces it and removes the temporary message.
+
 For a completely clean group this requires the bot to have Telegram's Delete Messages
 administrator permission. Slash-command menus remain private-chat only, and manually
 typed group commands are also deleted before their result is routed privately.
@@ -26,7 +31,7 @@ import logging
 
 import main as bot
 
-UI_VERSION = "all-news-v9-solid-keyboard-kept-alive"
+UI_VERSION = "all-news-v10-new-member-keyboard"
 
 _base_handle_message = bot.handle_message
 _base_handle_callback = bot.handle_callback
@@ -52,11 +57,31 @@ def group_inline_keyboard():
     return {"inline_keyboard": rows}
 
 
+def _clear_keyboard_keeper():
+    """Delete the current temporary keyboard message if one exists."""
+    global _keyboard_keeper_message_id
+    keeper = _keyboard_keeper_message_id
+    if not keeper:
+        stored = bot.get_setting("solid_keyboard_keeper_message_id")
+        try:
+            keeper = int(stored) if stored else None
+        except (TypeError, ValueError):
+            keeper = None
+    if keeper:
+        bot.telegram_api(
+            "deleteMessage",
+            {"chat_id": str(bot.GROUP_CHAT_ID), "message_id": keeper},
+        )
+    _keyboard_keeper_message_id = None
+    bot.set_setting("solid_keyboard_keeper_message_id", "")
+
+
 def group_keyboard_send_message(text, chat_id=None, reply_markup=None, disable_preview=True):
     """Attach the solid keyboard to every normal main-group bot post.
 
-    The short startup activation message remains only until a regular group post has
-    successfully taken over as the message carrying Telegram's persistent keyboard.
+    The short startup/new-member activation message remains only until a regular group
+    post has successfully taken over as the message carrying Telegram's persistent
+    keyboard.
     """
     global _keyboard_keeper_message_id
 
@@ -197,6 +222,11 @@ def is_group_message(message):
     return chat_id is not None and sender_id is not None and str(chat_id) != str(sender_id)
 
 
+def is_main_group_message(message):
+    chat_id = (message.get("chat") or {}).get("id")
+    return chat_id is not None and bool(bot.GROUP_CHAT_ID) and str(chat_id) == str(bot.GROUP_CHAT_ID)
+
+
 def delete_group_interaction_message(message):
     """Immediately remove a reply-keyboard press or group slash command."""
     chat_id = (message.get("chat") or {}).get("id")
@@ -209,8 +239,42 @@ def delete_group_interaction_message(message):
     )
 
 
+def activate_keyboard_for_new_members(message):
+    """Give members who joined after older keyboard posts a fresh solid keyboard."""
+    global _keyboard_keeper_message_id
+
+    members = list(message.get("new_chat_members") or [])
+    if not members or not is_main_group_message(message):
+        return None
+
+    # Remove an older temporary activation message so repeated joins do not clutter.
+    _clear_keyboard_keeper()
+
+    human_members = [member for member in members if not member.get("is_bot")]
+    names = [str(member.get("first_name") or "").strip() for member in human_members]
+    names = [name for name in names if name]
+    greeting = f"Welcome, {', '.join(names[:3])}!" if names else "Welcome!"
+
+    activation = _base_send_message(
+        "📰 <b>" + greeting + "</b>\n\n"
+        "Use the news buttons below to browse Maldives, Global, Important and topic news. "
+        "Your selection is delivered privately.",
+        bot.GROUP_CHAT_ID,
+        bot.main_keyboard(),
+        True,
+    )
+    if isinstance(activation, dict) and activation.get("message_id"):
+        _keyboard_keeper_message_id = activation["message_id"]
+        bot.set_setting("solid_keyboard_keeper_message_id", _keyboard_keeper_message_id)
+        logging.info("Activated solid news keyboard for %s new group member(s)", len(members))
+    return activation
+
+
 def handle_message(message):
-    """Delete visible group interactions, then let the core send results privately."""
+    """Activate new-member keyboards, delete group interactions, then route privately."""
+    if message.get("new_chat_members"):
+        activate_keyboard_for_new_members(message)
+
     text = str(message.get("text") or "").strip()
     from_group = is_group_message(message)
 
