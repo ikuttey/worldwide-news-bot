@@ -1,8 +1,8 @@
 """Strict private-response entry point for the climate/environment Telegram bot.
 
-Automatic news publishing remains in GROUP_CHAT_ID. Interactive button/command
-results requested from a group are sent only to the requesting user's Telegram
-user ID. This wrapper removes any dependency on chat.type for routing.
+Automatic scheduled news publishing remains in GROUP_CHAT_ID. Every interactive
+Telegram keyboard-button response is forced to the requesting user's private
+chat, including current buttons and stale buttons from older deployed menus.
 """
 
 import asyncio
@@ -12,6 +12,49 @@ import three_button_runner as app
 bot = app.bot
 
 
+# Current buttons plus buttons that may remain visible on older Telegram
+# keyboards after previous bot deployments. Keeping them here prevents an old
+# button from falling through to a group-facing legacy handler.
+ALL_KEYBOARD_BUTTONS = {
+    # Current main menu
+    "🇲🇻 Maldives",
+    "🌍 Global",
+    "🚨 Important",
+    "🧭 Related Topics",
+    # Current topic menu
+    "🪸 Reefs & Oceans",
+    "🚨 Weather",
+    "🦋 Wildlife",
+    "♻️ Pollution",
+    "🌱 Conservation",
+    "⚡ Clean Energy",
+    "🌡️ Climate",
+    "🏛️ Policy",
+    "🔬 Research",
+    "🏝️ Baa Atoll",
+    "⬅️ Main Menu",
+    # Older climate menus that may still be cached by Telegram clients
+    "📰 Latest",
+    "🔥 Trending",
+    "🚨 Extreme Weather",
+    "🌊 Oceans & Reefs",
+    "🪸 Reef Watch",
+    "♻️ Pollution & Waste",
+    "🏛️ Climate Policy",
+    "📡 Fetch Status",
+    "🔄 Check News Now",
+    "🔄 Refresh Menu",
+    "❓ Help",
+    # Very old menu buttons
+    "📰 Latest News",
+    "🌍 World",
+    "💻 Technology",
+    "💰 Business",
+    "⚽ Sports",
+    "🌊 Environment",
+}
+
+
 def strict_request_destination(message):
     chat = message.get("chat", {}) or {}
     sender = message.get("from", {}) or {}
@@ -19,9 +62,8 @@ def strict_request_destination(message):
     chat_id = chat.get("id")
     sender_id = sender.get("id")
 
-    # In a private Telegram chat, chat.id == from.id. In a group/supergroup,
-    # chat.id is the group while from.id is the person who pressed the button.
-    # Use the ID relationship instead of relying on chat.type.
+    # Telegram private chat: chat.id == from.id.
+    # Telegram group/supergroup: chat.id != from.id.
     if sender_id is not None and chat_id is not None and str(sender_id) != str(chat_id):
         return sender_id, chat_id, True
 
@@ -44,8 +86,7 @@ def strict_send_user_result(message, text, reply_markup=None):
         came_from_group,
     )
 
-    # The requested news/topic result is sent only to destination. For group
-    # requests destination is the user's Telegram ID, never GROUP_CHAT_ID.
+    # Requested content goes only to the individual user.
     result = bot.send_message(
         text,
         destination,
@@ -56,28 +97,84 @@ def strict_send_user_result(message, text, reply_markup=None):
         return result
 
     if came_from_group and origin_chat_id is not None:
-        # Telegram bots cannot initiate a private chat until the user has
-        # opened the bot and pressed Start. Do not leak the requested news list
-        # into the group; post only this short setup instruction.
+        # Telegram does not allow a bot to initiate a private conversation with
+        # someone who has never opened the bot. This is the only group-side
+        # response allowed for an interactive request, and it contains no news.
         bot.send_message(
             "📩 <b>Private reply is not enabled for you yet.</b>\n\n"
             "Open my bot profile and press <b>Start</b> once. Then return here "
-            "and press the news button again. Your requested results will be "
-            "sent only to your private chat.",
+            "and press the button again. Your requested results will be sent "
+            "only to your private chat.",
             origin_chat_id,
-            reply_markup=app.main_keyboard(),
         )
 
     return None
 
 
-# Replace the routing helpers used by three_button_runner.private_handle_command.
+# Install strict destination helpers used by the current app handler.
 app.request_destination = strict_request_destination
 app.send_user_result = strict_send_user_result
 
-# Keep the already-configured private command handler and menus active.
+
+_base_private_handler = app.private_handle_command
+
+
+def force_private_button_handler(message):
+    """Force every known keyboard button through a private chat context.
+
+    Some users can retain old reply-keyboard buttons after a deployment. Those
+    older button labels may be handled several layers down by legacy handlers.
+    Rewriting only the interactive message's chat destination guarantees those
+    legacy handlers also reply to the individual user rather than the group.
+    """
+    text = (message.get("text") or "").strip()
+    chat = message.get("chat", {}) or {}
+    sender = message.get("from", {}) or {}
+    chat_id = chat.get("id")
+    sender_id = sender.get("id")
+    came_from_group = (
+        sender_id is not None
+        and chat_id is not None
+        and str(sender_id) != str(chat_id)
+    )
+
+    if text in ALL_KEYBOARD_BUTTONS and came_from_group:
+        # Do not let the old manual-fetch button trigger a burst of automatic
+        # group posts. The scheduled news loop already checks sources itself.
+        if text == "🔄 Check News Now":
+            result = bot.send_message(
+                "🔎 <b>News monitoring is active.</b>\n\n"
+                "The bot checks sources automatically. Manual group-triggered "
+                "publishing is disabled so button activity stays private.",
+                sender_id,
+                reply_markup=app.main_keyboard(),
+            )
+            if not result:
+                strict_send_user_result(message, "Open the bot privately and press Start once.")
+            return
+
+        private_message = dict(message)
+        private_chat = dict(chat)
+        private_chat["id"] = sender_id
+        private_chat["type"] = "private"
+        private_message["chat"] = private_chat
+
+        bot.logging.info(
+            "Forcing keyboard button private: text=%r group=%s user=%s",
+            text,
+            chat_id,
+            sender_id,
+        )
+        _base_private_handler(private_message)
+        return
+
+    # Private-chat buttons already have the correct destination. Slash commands
+    # and non-button text keep their existing behavior.
+    _base_private_handler(message)
+
+
 bot.public_command_keyboard = app.main_keyboard
-bot.handle_command = app.private_handle_command
+bot.handle_command = force_private_button_handler
 bot.build_welcome_message = app.private_welcome
 
 
